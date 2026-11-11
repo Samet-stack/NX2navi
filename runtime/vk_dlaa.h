@@ -34,8 +34,9 @@ typedef struct {
 } VkDlaaCamera;
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
 // The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
-// RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
-// evaluation.
+// RGBA16F linear with HDR on (NX2NAVI_HDR = 1); made at each evaluation while vk_dlaa_hudless_wanted (frame generation
+// sets it); 1 once per evaluation. The game's own HDR (native) makes none: its PQ encode runs inside the game after the
+// HUD is drawn, and a linear copy would not match the presented picture.
 extern int vk_dlaa_hudless_wanted;
 int vk_dlaa_fg_hudless(VkImage *img, VkImageView *view, uint32_t *w, uint32_t *h, VkFormat *fmt);
 int vk_dlaa_fg_camera(VkDlaaCamera *c);     // ... and its temporal upscaler is AMD FSR 3.1 (NX2NAVI_TAA = fsr3) instead of DLSS

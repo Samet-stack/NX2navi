@@ -1856,8 +1856,10 @@ evaluated:
 // The HUD-less picture (vk_dlaa_fg_hudless): DLSS's output, which the HUD is then drawn over, through the encode the
 // game's last pass gives its picture (linear to sRGB), as RGBA8 UNORM bytes like the picture the present reads. With
 // HDR (NX2NAVI_HDR = 1) the game's picture stays float and linear up to the present, which encodes it to PQ
-// (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes inside the
-// game, which this cannot follow: no HUD-less picture there.
+// (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes its PQ
+// picture inside the game, after the HUD has been drawn on this linear target. Repeating that encode is not possible
+// here, and a linear copy would not match the swapchain, so no HUD-less picture is made: frame generation stays off
+// rather than tagging a picture that does not match (vk_dlssg.c).
 int vk_dlaa_hudless_wanted;
 static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();

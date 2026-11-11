@@ -129,14 +129,15 @@ void vk_present_drain(void) {
 // the interface intact (a lighting pass), a light going out, or ground and walls missing and then back. The game runs
 // on meanwhile, so nothing waits. The hold comes from an allowance of this many milliseconds, used up by the time
 // held and filled again at an eighth of the clock's rate: a pipeline that takes longer, or a run of them on a first
-// visit with nothing recorded, shows its incomplete frames as before and does not freeze the picture. Not with DLSS
-// Frame Generation, which is told about every frame.
+// visit with nothing recorded, shows its incomplete frames as before and does not freeze the picture. It holds with
+// DLSS Frame Generation too: the present is skipped, so the generator is not given the incomplete picture (its
+// constants and tags are set only at a host present, gfx_present.c). The previous picture stays, a longer gap between
+// two rendered frames, instead of several generated frames of a picture that is missing draws.
 // The same hold covers a change of the scene's size (a DLSS or FSR 3.1 mode picked in the menu, vk_dlaa.c
 // vk_dlaa_resized_take): the first frames drawn into the game's new, empty scene targets come out dark or black, so the
 // previous picture stays for RESIZE_HOLD presents from the first frame of the new size. That is once per change of a
-// setting and does not use the allowance. It holds with DLSS Frame Generation too: a present left out is a longer gap
-// between two rendered frames to it (its constants and tags are set at the host present, gfx_present.c), and a dark
-// frame it is given comes out as several generated ones.
+// setting and does not use the allowance. A present left out is the same longer gap, and a dark frame the generator
+// is given comes out as several generated ones.
 // And it covers an area load (vk_exec_draw.c vk_exec_pool_loading): while the texture pool still makes the area's
 // textures, the frames show the ground and the walls as black stand-ins, so the picture before the load stays for up
 // to LOAD_HOLD_NS, also beside the allowance.
@@ -166,7 +167,7 @@ static void frame_hold_refill(uint64_t now) {
 // Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then).
 int vk_frame_hold_left(void) {
     frame_hold_refill(kern_now_ns());
-    return FH.left_ns > 0 && !vk_dlssg_active();
+    return FH.left_ns > 0;
 }
 
 // 1: this frame is not shown. skipped: the draws it lacks; resized: its scene is the first of a new size.
@@ -193,16 +194,27 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
                (unsigned long long)frame, (unsigned long long)FH.load_held, (double)(kern_now_ns() - FH.load_t0) / 1e6);
         FH.load_t0 = 0;
     }
-    int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
+    int hold = skipped && FH.left_ns > 0;
     if (hold && !FH.holding) FH.runs++;
     if (skipped && !hold) FH.shown++;
     FH.holding = hold;
     if (hold) FH.held++;
+    if (hold && vk_dlssg_active()) {
+        static int told;
+        if (!told++)
+            rt_log("vk: frame %llu held back with DLSS frame generation on: it is not shown and not given to the "
+                   "generator (%llu held back so far)",
+                   (unsigned long long)frame, (unsigned long long)FH.held);
+    }
     static uint64_t logged_at, logged_held, logged_shown;
     if (!hold && FH.held + FH.shown != logged_held + logged_shown && frame - logged_at >= 600) {
-        rt_log("vk: frame %llu: %llu frames with skipped draws held back so far in %llu runs, %llu shown incomplete "
-               "(allowance used up)", (unsigned long long)frame, (unsigned long long)FH.held,
-               (unsigned long long)FH.runs, (unsigned long long)FH.shown);
+        // "allowance used up" only when a frame was actually shown incomplete. With generation on the hold used to be
+        // skipped entirely, and this line still said the allowance was gone.
+        int used = FH.shown != logged_shown;
+        rt_log("vk: frame %llu: %llu frames with skipped draws held back so far in %llu runs, %llu shown incomplete%s%s",
+               (unsigned long long)frame, (unsigned long long)FH.held, (unsigned long long)FH.runs,
+               (unsigned long long)FH.shown, used ? " (allowance used up)" : "",
+               vk_dlssg_active() ? " (DLSS frame generation on)" : "");
         logged_at = frame, logged_held = FH.held, logged_shown = FH.shown;
     }
     if (hold && (rt_trace & RT_TRACE_PRESENT))
