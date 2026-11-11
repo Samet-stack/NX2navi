@@ -81,6 +81,29 @@ typedef struct Mixer {
 
 static _Atomic float device_volume = 1.0f;
 
+// NX2NAVI_CENTER_BOOST (default 0): percent applied to the centre channel only while a 5.1 device sink is folded
+// into stereo (audio_mixer_render). 0 leaves that fold as it is. 141 is about +3 dB on the centre, which is where a
+// 5.1 mix usually puts dialogue. "ab" uses 141 in the B blocks only (host.h rt_ab). Read once; the A/B side is read
+// each render. 50..400, anything else is off.
+static int center_boost_pct(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = cfg_get("NX2NAVI_CENTER_BOOST");
+        if (!e || !*e || !strcmp(e, "0")) mode = 0;
+        else if (!strcmp(e, "ab")) mode = -2;
+        else {
+            int n = atoi(e);
+            mode = n >= 50 && n <= 400 && n != 100 ? n : 0;
+            if (e && *e && !mode)
+                rt_log("audio: NX2NAVI_CENTER_BOOST=%s is not 0, ab or 50..400 (100 is the same level); off", e);
+        }
+        if (mode > 0) rt_log("audio: stereo downmix centre at %d%% (NX2NAVI_CENTER_BOOST)", mode);
+        else if (mode == -2) rt_log("audio: stereo downmix centre at 141%% in the B blocks (NX2NAVI_CENTER_BOOST=ab)");
+    }
+    if (mode == -2) return rt_ab() ? 141 : 0;
+    return mode;
+}
+
 // NX2NAVI_VOLUME: the player's volume in percent (0..100) on top of the game's own; a live setting (the
 // menu), parsed again when cfg_version changes. Render thread only.
 static float host_volume(void) {
@@ -1173,6 +1196,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         const float gain = host_volume() * atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
         const float *ch[6] = {0};
         float raw[2 * MAX_FRAME];
+        const int center_pct = center_boost_pct();
+        const float center_gain = center_pct ? (float)center_pct / 100.0f : 1.0f;
         for (uint32_t c = 0; c < sink->input_count; c++) if (sink->inputs[c] >= 0 && sink->inputs[c] < m->nbuf) ch[c] = mixbuf(m, sink->inputs[c]);
         if (rt_trace & RT_TRACE_AUDIO)   // what the game puts on each input: shows whether it mixes for 5.1 (level_note)
             for (int c = 0; c < 6; c++)
@@ -1184,6 +1209,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             } else if (sink->input_count >= 6) {   /* 5.1 -> stereo; the LFE is left out, as the Switch's downmix does */
                 float ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f, cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f, sf = sink->downmix_enabled ? sink->downmix[2] : 0.7071f;
                 float C = ch[2] ? ch[2][k] : 0;
+                if (center_pct) C *= center_gain;   // NX2NAVI_CENTER_BOOST: dialogue on the centre, stereo fold only
                 s[0] = ff * (ch[0] ? ch[0][k] : 0) + cf * C + sf * (ch[4] ? ch[4][k] : 0);
                 s[1] = ff * (ch[1] ? ch[1][k] : 0) + cf * C + sf * (ch[5] ? ch[5][k] : 0);
             } else if (sink->input_count >= 2) { s[0] = ch[0] ? ch[0][k] : 0; s[1] = ch[1] ? ch[1][k] : 0; }
