@@ -167,6 +167,8 @@ static struct {
     VkDescriptorSetLayout ds_last_layout[2];
     int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
     int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
+    VkDescriptorSet pool_set;            // NX2NAVI_POOL_BIND_SKIP: set 2 last bound in this command buffer
+    VkPipelineLayout pool_layout;
 } B;
 
 // Contents of B.ds_last: the set's packed descriptors (VkDescSlot), which with its layout determine every write. A draw
@@ -2354,6 +2356,21 @@ static int pool_fill(VkExec *ex, uint32_t id, uint32_t mask, uint64_t tok) {
 
 static void pool_sync_entries(VkExec *ex);
 
+// NX2NAVI_POOL_BIND_SKIP (default 0; ab = on in the B blocks): a draw that binds the texture pools records
+// vkCmdBindDescriptorSets for set 2 on every such draw (bind_resources). The set is update-after-bind when the device
+// allows it, and a command buffer that already bound this set still sees writes into it. Skip that call when this
+// command buffer already bound the same set under the same layout and pool_sync wrote nothing and did not switch
+// sets. A new command buffer clears B (vk_exec_draw_new_cb), so the first draw of a part still binds.
+static int pool_bind_skip_on(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("POOL_BIND_SKIP", "0");
+        if (mode == 1) rt_log("vk_exec: the texture pool set is not bound again while it is unchanged (NX2NAVI_POOL_BIND_SKIP)");
+        else if (mode == 2) rt_log("vk_exec: the texture pool set is not bound again while it is unchanged, in the B blocks (NX2NAVI_POOL_BIND_SKIP=ab)");
+    }
+    return RT_KNOB_ON(mode);
+}
+
 static void pool_sync(VkExec *ex) {
     if (!PL.layout) vk_pool_set_layout();
     uint64_t from = 0, pre = PL.logn;
@@ -3416,8 +3433,16 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
     }
     if (info->pool) {   // set 2: the texture and sampler pools
+        uint64_t log0 = PL.logn;
+        VkDescriptorSet set0 = PL.set;
         pool_sync(ex);
-        vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, 2, 1, &PL.set, 0, NULL);
+        int skip_on = pool_bind_skip_on();
+        int same = skip_on && B.pool_set && B.pool_set == PL.set && B.pool_layout == info->layout &&
+                   PL.set == set0 && PL.logn == log0;
+        if (!same) {
+            vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, 2, 1, &PL.set, 0, NULL);
+            if (skip_on) B.pool_set = PL.set, B.pool_layout = info->layout;
+        }
         RS.volatile_ = 1;   // the pools may change under an equal draw: build the next one again
     }
     if (skip) {

@@ -124,3 +124,51 @@ de diagnostic n’est pas faite.
 - Les images lentes sont surtout attribuées au replay (dizaines de ms), plus une image de 2,0 s au premier gros
   chargement (compilation de pipelines).
 - La voix 0 joue. `audio_stats` était éteint. Le niveau des voix de PNJ n’est pas dans ce log.
+
+## 7. Ancien ini (23:36) contre le nouvel ini (23:55, `nx2navi_live.log`)
+
+Les deux lancements sont l’exe 0.8.0 déjà installé. Rien n’a été recompilé.
+
+| | Ancien ini, log 23:36 | Nouvel ini, log 23:55 |
+|---|---|---|
+| Clés lues | 15. `framegen_multiplier = 4` (le log le baisse à 2x), `perf_overlay = fps`, pas de `hdr`, pas de `trace`, pas de `replay_time`, pas de `audio_stats` | 44 clés, ligne 2 : `hdr = native`, `framegen_multiplier = 2`, `perf_overlay = full`, `replay_time = 1`, `trace = perf`, `audio_stats = 1`, `audio_game_prio = 2`, `dlaa_objmv = 1`, `recorder_core = auto` |
+| Lignes `perf:` | aucune | une fenêtre toutes les 60 images |
+| Colonne replay « on the CPU » | 0,0 partout, parce que `replay_time` était à 0 | renseignée. Exemple sur 60 s : replay 24 101 ms dont 18 078 ms sur le CPU (75 %), ligne 3421 |
+| Zones nommées | le log ne nomme pas la zone | `KokiriForest_Child` image 844, installée image 1570 (ligne 1200). `HyruleField_Child` image 2543, installée image 2997. `InsideTheDekuTree` image 32583 (ligne 17274) |
+| Kokiri installée | non mesuré (pas de `perf:`) | image 1560 : **240,0 images/s**, replay **0,20 ms**, GPU 0,11 ms, `bound: cpu` (lignes 1184 et la fenêtre GPU). Miroir : **4,0 syncs**, **1,0 flush**, merge **0**, tracking **0,028 ms** (ligne 1191) |
+| Plaine d’Hyrule | non séparée | image 5100 : **75,2 images/s**, replay **6,61 ms**, GPU **6,81 ms**, `bound: cpu` (lignes 3193-3194). Le GPU attend la soumission suivante **6,07 ms** (ligne 3195). Miroir : **6,00 submits**, **197,9 syncs**, **64,7 flush** (47,360 Mio), merge **28,294 Mio** en 44 dispatches, tracking **0,431 ms** dont syncs **0,051 ms** (ligne 3201). Les 64 flush ne copient presque rien : « flushed and not copied » **46,717 Mio** (ligne 3202) |
+| Callback `-435424` | pas de ligne | somme depuis la ligne d’avant (toutes les 240 soumissions, `runtime/vk_exec.c` vers 1765). À l’image 5100 : **8,731 ms pour 40 appels** (ligne 3192), pas 8 ms par image. Le nom de la fonction n’est pas dans le log : c’est la distance à `vk_completion_add` (`runtime/vk_sync.c` lignes 193-207). Pas de fichier map ici, donc la fonction n’est pas identifiée |
+
+En forêt Kokiri installée, ce log-ci n’est pas limité par le replay : 0,20 ms de replay et le plafond 240. Le replay à 6–9 ms, les ~200 syncs et les ~65 flush sont la plaine, pas Kokiri. Gain de `pool_bind_skip` : **non mesuré**.
+
+## 8. Branche replay : `cursor/pool-bind-skip-7f0d`
+
+`pool_bind_skip = 0` par défaut. À 1, un draw ne réenregistre pas le bind du set de textures si ce command buffer a déjà ce set et que le pool n’a rien écrit (`runtime/vk_exec_draw.c`, `bind_resources`). Le chemin à 0 appelle `vkCmdBindDescriptorSets` comme avant.
+
+Copie d’abord `D:\Games\NX2navi\ocarina.exe` vers `ocarina-stock.exe`.
+
+```bat
+git clone --branch cursor/pool-bind-skip-7f0d https://github.com/Samet-stack/NX2navi.git D:\src\NX2navi-replay
+cd /d D:\src\NX2navi-replay
+py -I tools\make_game.py --rebuild --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
+```
+
+Le dépôt n’a pas `libnx2navirt.a` : le log de compile doit dire que `runtime/` est compilé, pas « the runtime comes prebuilt ». Si `--rebuild` refuse, utilise `--exefs D:\Games\NX2navi\exefs --romfs D:\Games\NX2navi\romfs --out D:\Games\NX2navi-replay` et copie `nx2navi.ini` plus `profile`.
+
+Même ini que le lancement 23:55 (`trace = perf`, `replay_time = 1`). Ajoute seulement :
+
+```ini
+[performance]
+pool_bind_skip = ab
+
+[diagnostics]
+ab = 20
+```
+
+Même sauvegarde. 60 s en forêt Kokiri installée (devant la maison), puis 60 s au même endroit dans la plaine (le log doit dire `HyruleField_Child settled`). Pas de carrés ni d’image noire. Puis :
+
+```bat
+py -I tools\ab_summary.py D:\Games\NX2navi\logs\nx2navi.log
+```
+
+Note `replay avg` et `bound` des fenêtres A et B. Reviens avec `pool_bind_skip = 0`, ou en recopiant `ocarina-stock.exe` sur `ocarina.exe`.
