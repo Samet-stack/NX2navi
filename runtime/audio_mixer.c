@@ -93,6 +93,34 @@ static float host_volume(void) {
     v = (float)((pct < 0 ? 0 : pct > 100 ? 100 : pct) / 100);
     return v;
 }
+
+// NX2NAVI_AUDIO_CENTER_GAIN (default 1, live): multiplies the centre coefficient of a 5.1 mix folded
+// into stereo. 1 leaves that coefficient (0.707 when the game's own downmix coefficients are off).
+// The loudness that makes the voices easy to hear is not measured. Outside 0.5..4 is held to that range.
+static float center_gain(void) {
+    static float g = 1.f;
+    static unsigned seen = ~0u;
+    unsigned ver = cfg_version();
+    if (ver == seen) return g;
+    seen = ver;
+    double v = cfg_double("NX2NAVI_AUDIO_CENTER_GAIN");
+    if (v < 0.5) v = 0.5;
+    if (v > 4.0) v = 4.0;
+    g = (float)v;
+    return g;
+}
+
+// One line when the gain changes, on the stereo downmix only. base is the coefficient before the gain.
+static void note_center_gain(float base, float g) {
+    static float seen = -1.f;
+    if (g == seen) return;
+    seen = g;
+    if (g == 1.f)
+        rt_log("audio: stereo downmix centre coefficient %.3f (audio_center_gain 1, unchanged)", base);
+    else
+        rt_log("audio: stereo downmix centre coefficient %.3f (audio_center_gain %.3f on %.3f); a sample over full "
+               "scale is scaled down to full scale", base * g, g, base);
+}
 static unsigned audio_revision(const AudioRenderer *r) { unsigned byte = r->revision >> 24; return byte >= '0' ? byte - '0' : 0; }
 static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
     if (m->reported & (1u << bit)) return;
@@ -1171,6 +1199,16 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                    sink->downmix[0], sink->downmix[1], sink->downmix[2], sink->downmix[3]);
         }
         const float gain = host_volume() * atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
+        const float cg = center_gain();
+        const int stereo_5 = sink->input_count >= 6 && oc != 6;   /* 5.1 folded into stereo */
+        float ff = 1.f, cf = 0.7071f, sf = 0.7071f;
+        if (stereo_5) {
+            ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f;
+            cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f;
+            sf = sink->downmix_enabled ? sink->downmix[2] : 0.7071f;
+            note_center_gain(cf, cg);
+            if (cg != 1.f) cf *= cg;   /* 1 leaves the coefficient, so the sum is the downmix this file had before */
+        }
         const float *ch[6] = {0};
         float raw[2 * MAX_FRAME];
         for (uint32_t c = 0; c < sink->input_count; c++) if (sink->inputs[c] >= 0 && sink->inputs[c] < m->nbuf) ch[c] = mixbuf(m, sink->inputs[c]);
@@ -1182,15 +1220,26 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             if (sink->input_count >= 6 && oc == 6) {
                 for (int c = 0; c < 6; c++) s[c] = ch[c] ? ch[c][k] : 0;
             } else if (sink->input_count >= 6) {   /* 5.1 -> stereo; the LFE is left out, as the Switch's downmix does */
-                float ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f, cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f, sf = sink->downmix_enabled ? sink->downmix[2] : 0.7071f;
                 float C = ch[2] ? ch[2][k] : 0;
                 s[0] = ff * (ch[0] ? ch[0][k] : 0) + cf * C + sf * (ch[4] ? ch[4][k] : 0);
                 s[1] = ff * (ch[1] ? ch[1][k] : 0) + cf * C + sf * (ch[5] ? ch[5][k] : 0);
             } else if (sink->input_count >= 2) { s[0] = ch[0] ? ch[0][k] : 0; s[1] = ch[1] ? ch[1][k] : 0; }
             else s[0] = s[1] = ch[0] ? ch[0][k] : 0;
             raw[2 * k] = s[0] * gain; raw[2 * k + 1] = s[1] * gain;   /* NX2NAVI_AUDIO_DUMP: the front pair before clipping */
+            // A centre boost can sum the pair past full scale. Scale that sample down to full scale so the
+            // boost is not a hard clip. At gain 1 this does not run, and the write below is the old clip.
+            if (cg != 1.f && stereo_5) {
+                float a0 = raw[2 * k] < 0 ? -raw[2 * k] : raw[2 * k];
+                float a1 = raw[2 * k + 1] < 0 ? -raw[2 * k + 1] : raw[2 * k + 1];
+                float peak = a0 > a1 ? a0 : a1;
+                if (peak > 1.f && peak == peak) {
+                    float ksc = 1.f / peak;
+                    raw[2 * k] *= ksc;
+                    raw[2 * k + 1] *= ksc;
+                }
+            }
             for (int c = 0; c < oc; c++) {
-                float x = s[c] * gain;
+                float x = cg != 1.f && stereo_5 && c < 2 ? raw[2 * k + c] : s[c] * gain;
                 // NaN (a NaN sample, an effect's state gone NaN) reaches the device as silence, not full scale
                 out[oc * k + c] = x > 1 ? 1 : x < -1 ? -1 : x == x ? x : 0;
             }
