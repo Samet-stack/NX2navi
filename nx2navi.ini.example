@@ -298,6 +298,10 @@
 # draw's pipeline when its state repeats, remember texture descriptors between draws, update descriptors in bulk,
 # skip push constants that did not change.
 # bind_skip = 1
+# 1: a draw does not record the texture-pool descriptor bind again when this command buffer already bound the same set
+# and the pool wrote nothing since. 0 (default) binds it on every draw that is not skipped whole. ab follows the A/B
+# blocks. The pictures must match; the gain on the replay thread is not measured yet.
+# pool_bind_skip = 0
 # shader_memo = 1
 # 1 flushes every shader cache file to the disk before it is used, as earlier versions did; 0 (default) flushes only
 # the stored game code, which makes shader preparation about twice as fast (a torn file is translated again).
