@@ -634,6 +634,10 @@
 # game is told the same channel count and mixes for it. A change while the game runs takes effect at once: the game is
 # told its output device changed, as on a console, and mixes for the new count.
 # audio_channels = stereo
+# Centre channel while a 5.1 mix is folded into stereo, in percent. 0 (default) leaves the fold as it is (about 0.707
+# on the centre when the game does not set its own downmix). 141 is about +3 dB, for dialogue that sits on the centre
+# and comes out quiet on headphones. 50 to 400, or ab (141 in the B blocks of NX2NAVI_AB). Takes effect at the next start.
+# center_boost = 0
 # Which output device the sound plays on. default (the default): the system default device, which the game follows when
 # the Windows default changes. Or a number, counting from 1 in the order `nx2navi.exe --list-audio-devices` prints; or part
 # of a device's name, ignoring case (`headphones`). When nothing matches, or the device will not open, the log lists the

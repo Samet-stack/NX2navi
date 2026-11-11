@@ -113,6 +113,37 @@ Pour revenir au binaire du launcher si une branche a été compilée par-dessus 
 réinstalle sa version (journal du 11/11, `finished in 26.4 min`). Ne lance pas une compilation tant que cette relance
 de diagnostic n’est pas faite.
 
+## Branche centre (voix trop faibles) : `cursor/center-boost-7f0d`
+
+La clé `center_boost` vaut 0 par défaut : le mélange stéréo ne change pas (`runtime/audio_mixer.c`, le repli 5.1 vers stéréo).
+`141` multiplie seulement le canal centre par 1,41 avant ce repli (environ +3 dB). `ab` fait ça dans les blocs B.
+
+Construire, sans écraser le jeu qui marche. Le dépôt git n’a pas la bibliothèque runtime précompilée du launcher, donc
+`runtime/` est recompilé. Le toolchain est celui du launcher, pas `C:\msys64`.
+
+```bat
+copy D:\Games\NX2navi\ocarina.exe D:\Games\NX2navi\ocarina-stock.exe
+git clone --branch cursor/center-boost-7f0d https://github.com/Samet-stack/NX2navi.git D:\src\NX2navi-center
+cd /d D:\src\NX2navi-center
+py -I tools\make_game.py --rebuild --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
+```
+
+Si `--rebuild` demande les fichiers du jeu, relance avec
+`--exefs D:\Games\NX2navi\exefs --romfs D:\Games\NX2navi\romfs --out D:\Games\NX2navi-center` et copie `nx2navi.ini` et
+`profile` dans ce dossier. Tu lances alors `D:\Games\NX2navi-center\ocarina.exe`.
+
+Dans l’ini, pour un essai oreille :
+
+```ini
+[audio]
+center_boost = 141
+```
+
+Ou, dans le même lancement, `ab = 20` sous `[diagnostics]` et `center_boost = ab`. Parle à un PNJ. Le log doit contenir
+`stereo downmix centre`. Reviens à `center_boost = 0`. Pour l’exe d’origine : copie `ocarina-stock.exe` sur `ocarina.exe`.
+
+Ne lance cette branche qu’après le lancement `trace = perf` du 0.8.0 déjà installé.
+
 ## 6. Ce que le log de 23:36 a déjà mesuré
 
 À ne pas refaire juste pour les revoir. Détail dans le rapport. En bref, sur cet exe 0.8.0, ancien ini,
