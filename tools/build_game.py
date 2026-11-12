@@ -70,6 +70,7 @@ import urllib.request
 from pathlib import Path
 
 import check_isa
+import fast_build
 import romfs_index
 import build_shaders
 from check_content import GENERATED_MARKER
@@ -97,7 +98,8 @@ SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll']
 
 # Flags for generated code, plus -march for the FP/SIMD lowering.
 # --cpu v2 replaces the level for CPUs without AVX2/FMA; runtime/fma.c then supplies the correctly rounded fma the
-# lowering needs (runtime/simd.h).
+# lowering needs (runtime/simd.h). --fast (set_fast) replaces the -O level and adds thin LTO; the lists above are the
+# default build, which does not change when --fast is left out.
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
@@ -112,22 +114,56 @@ def set_cpu(cpu):
     RT_FLAGS.append(f'-DRT_CPU_LEVEL={3 if cpu == "v3" else 2}')
 
 
-# Profile-guided optimisation (--pgo). Both modes compile the generated code at -O2, the level the profile's inlining and
-# hot/cold layout work at. A static function's profile name carries its source path by default; the base name alone
-# keeps the names equal between the training build and a build from another tree (a worktree, an install).
-PGO_NAMES = ['-mllvm', '-static-func-full-module-prefix=false']
+def set_fast(march=None):
+    """--fast, after set_cpu. march is a -march= flag, or None to keep the one set_cpu chose.
+    Both the lifted code and the runtime go to -O3 with thin LTO. The runtime's -g is left out: this is not a debug
+    build. assert() is compiled out (-DNDEBUG); rt_fatal and the perf traces stay. Does nothing to the default build,
+    which never calls this."""
+    for flags in (GEN_FLAGS, RT_FLAGS):
+        replaced = False
+        for i, flag in enumerate(flags):
+            if flag in ('-O0', '-O1', '-O2', '-O3', '-Os', '-Oz'):
+                flags[i] = fast_build.FAST_OPT
+                replaced = True
+        if not replaced:
+            flags.insert(0, fast_build.FAST_OPT)
+        if '-g' in flags:
+            flags.remove('-g')
+        if march:
+            hit = False
+            for i, flag in enumerate(flags):
+                if flag.startswith('-march='):
+                    flags[i] = march
+                    hit = True
+            if not hit:
+                flags.append(march)
+        for flag in fast_build.FAST_CFLAGS:
+            if flag not in flags:
+                flags.append(flag)
+    for flag in fast_build.FAST_LDFLAGS:
+        if flag not in LINK_FLAGS:
+            LINK_FLAGS.append(flag)
+
+
+# Profile-guided optimisation (--pgo). Without --fast the generated code is compiled at -O2, the level the profile's
+# inlining and hot/cold layout work at. --fast keeps -O3. A static function's profile name carries its source path by
+# default; the base name alone keeps the names equal between the training build and a build from another tree.
 PGO_INPUT = None   # the .profdata of --pgo FILE: every compile depends on it, so a new profile rebuilds them
 
 
 def set_pgo(pgo, out):
     """--pgo gen: instrument the generated code and the runtime; nx2navi.exe adds its counts to
     out/pgo/default_<id>.profraw every minute and at exit (runtime/platform win32.c), across runs. --pgo FILE: compile
-    with that merged profile (tools/pgo.py merge). Functions the profile never saw run are optimised for size."""
+    with that merged profile (tools/pgo.py merge). Functions the profile never saw run are optimised for size.
+    An -O3 already chosen by --fast is left as it is."""
     global PGO_INPUT
-    GEN_FLAGS[GEN_FLAGS.index('-O1')] = '-O2'
+    for i, flag in enumerate(GEN_FLAGS):
+        if flag in ('-O0', '-O1'):
+            GEN_FLAGS[i] = '-O2'
+            break
     if pgo == 'gen':
         # absolute: the instrumented exe resolves the directory against its own working directory
-        flags = [f'-fprofile-generate={cmd_arg((out / "pgo").resolve().as_posix())}']
+        flags = list(fast_build.pgo_gen_flags(cmd_arg((out / 'pgo').resolve().as_posix())))
         RT_FLAGS.append('-DNX2NAVI_PGO_GEN')
         LINK_FLAGS.append('-fprofile-generate')   # links clang_rt.profile
     else:
@@ -136,10 +172,9 @@ def set_pgo(pgo, out):
             sys.exit(f'--pgo {pgo}: no such profile')
         # unprofiled: chunks the training never entered; out-of-date and backend-plugin: functions whose code changed
         # since the training, which then compile without a profile
-        flags = [f'-fprofile-use={cmd_path(PGO_INPUT)}', '-Wno-profile-instr-unprofiled',
-                 '-Wno-profile-instr-out-of-date', '-Wno-backend-plugin']
-    GEN_FLAGS.extend(flags + PGO_NAMES)
-    RT_FLAGS.extend(flags + PGO_NAMES)
+        flags = list(fast_build.pgo_use_flags(cmd_path(PGO_INPUT)))
+    GEN_FLAGS.extend(flags)
+    RT_FLAGS.extend(flags)
 if WIN:
     # _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain)
     # to Windows 7, which hides the per-monitor DPI functions gfx_window_win.c and dpi_probe_win.c call.
@@ -814,6 +849,12 @@ def main():
     ap.add_argument('--version', default='v121', help='game version (default v121)')
     ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
                     help='target CPU level: v3 (AVX2/FMA, default) or v2 (SSE4.2, for older CPUs; slower)')
+    ap.add_argument('--fast', action='store_true',
+                    help='optional profile: -O3, thin LTO, -fno-plt, -fomit-frame-pointer, -DNDEBUG, on the lifted '
+                         'code and the runtime. The default build is unchanged. See BUILD_FAST.md')
+    ap.add_argument('--march', choices=tuple(fast_build.MARCHES),
+                    help='with --fast: -march (znver4, v3, v4). Default: the --cpu level. znver4 and v4 need AVX-512; '
+                         'the exe then runs only on a CPU that has it')
     ap.add_argument('--gen', type=Path, help='generated C directory (default generated/<version>)')
     ap.add_argument('--out', type=Path, help='build directory (default build/<version>)')
     ap.add_argument('--modules', help='comma-separated subset of the layout modules (default all)')
@@ -849,13 +890,25 @@ def main():
     ap.add_argument('--runtime-lib', type=Path, help=f'link against this {LIB_NAME} instead of compiling runtime/ '
                                                     f'({", ".join(sorted(INSTALL_SIDE))} and modules.c still compile)')
     ap.add_argument('--pgo', metavar='gen|FILE',
-                    help='profile-guided optimisation, generated code at -O2: gen builds an instrumented nx2navi.exe '
-                         '(needs --toolchain on Windows: MSYS2 clang ships no profile runtime); FILE builds with that '
-                         '.profdata (tools/pgo.py merge)')
+                    help='profile-guided optimisation. Without --fast the generated code is compiled at -O2; --fast '
+                         'keeps -O3. gen builds an instrumented nx2navi.exe (needs --toolchain on Windows: MSYS2 clang '
+                         'ships no profile runtime); FILE builds with that .profdata (tools/pgo.py merge)')
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
+    if args.march and not args.fast:
+        sys.exit('--march is part of --fast. The default build keeps the --cpu level')
+    if args.march and args.cpu == 'v2':
+        sys.exit('--march and --cpu v2 ask for two instruction sets; pass one of them')
+    if args.fast and args.make_runtime_lib:
+        sys.exit('--make-runtime-lib builds the generic runtime a release ships. It does not take --fast')
+    if args.fast and args.runtime_lib:
+        sys.exit('--fast compiles the runtime from source. --runtime-lib would leave the replay in the generic library')
     set_cpu(args.cpu)
+    if args.fast:
+        set_fast(fast_build.march_flag(args.march) if args.march else None)
+        print('build_game: fast profile (not the default): -O3 -flto=thin -fno-plt -fomit-frame-pointer -DNDEBUG, '
+              + (fast_build.march_flag(args.march) if args.march else f'-march=x86-64-{args.cpu}'))
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
     out = (args.out or ROOT / 'build' / args.version).resolve()
@@ -925,7 +978,13 @@ def main():
 
     cpus = os.cpu_count() or 1
     budget = min(MEM_BUDGET, int(total_ram() * 0.8))
-    jobs = args.jobs or max(1, min(cpus, budget // JOB_MEM))
+    # -O3 of a lifted chunk is larger than the -O1 peak JOB_MEM was set for. Counting two budgets per compile is a
+    # guard, not a measured peak; --jobs overrides it.
+    per_job = JOB_MEM * (2 if args.fast and not args.jobs else 1)
+    jobs = args.jobs or max(1, min(cpus, budget // per_job))
+    if args.fast and not args.jobs:
+        print(f'build_game: fast profile runs at most {jobs} compiles at once ({mib(per_job)} counted each). '
+              'Pass --jobs to choose. The cap is a guard, not a measured peak.')
     missing = [n for n in names if n not in hashes]
     if missing:
         sys.exit(f'{expected}: no exefs_sha256 for {missing}')
@@ -988,7 +1047,7 @@ def main():
         size = sum(o.stat().st_size for o in files)
         print(f'  {mod:8} {len(files):5} objects {mib(size):>14}')
     verify_objects(out, objs, pairs is not None, main_out, pairs, base, env)
-    if args.cpu == 'v2':
+    if args.cpu == 'v2' and not args.march:
         # Inline assembly, target attributes and intrinsics pass -march=x86-64-v2 by; one vmovdqa of a YMM register
         # stops a CPU without AVX (tools/check_isa.py)
         fail = check_isa.check_objects(objs['runtime'], objdump_tool(), out / 'obj' / 'runtime' / 'isa-v2.json')
