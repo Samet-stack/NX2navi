@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "gfx.h"
 #include "host.h"
 #include "vk.h"
 #include "vk_dlaa.h"
@@ -53,13 +54,21 @@ static struct {
     uint32_t cur;    // the frame the present thread blits and presents next (vk_dlssg_present_frame)
     uint32_t started;      // the last frame vk_dlssg_frame_start started
     uint64_t hosted_ns;    // kern_now_ns after the last host present
+    int arm_reset;         // the next frame that turns generation on discards the generator's history
+    int gap;               // a host present was skipped (vk_dlssg_held_back); the present thread reads it
+    uint64_t gaps;         // how many shown frames followed a held-back present
+    uint64_t presents;     // vk_dlssg_frame calls
+    uint64_t miss;         // times generation was turned off because depth or motion vectors were missing
+    uint64_t no_hudless;   // times it was turned off because the picture without the HUD was missing
+    uint64_t no_hudless_frames;   // frames with depth and motion but no such picture
+    uint64_t hud_frames;   // frames handed to the generator with that picture
     PFN_nx2sl_shutdown shutdown;
     PFN_vkCreateSwapchainKHR create_sc;
     PFN_vkDestroySwapchainKHR destroy_sc;
     PFN_vkGetSwapchainImagesKHR images;
     PFN_vkAcquireNextImageKHR acquire;
     PFN_vkQueuePresentKHR present;
-} S = {.wanted = -1, .fail = DLSSG_NO_FILES, .shown_mult = 1};
+} S = {.wanted = -1, .fail = DLSSG_NO_FILES, .shown_mult = 1, .arm_reset = 1};
 
 static void sl_line(const char *line) { rt_log("%s", line); }
 
@@ -168,7 +177,10 @@ void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {
     S.present = (PFN_vkQueuePresentKHR)g(dev, "vkQueuePresentKHR");
     S.active = S.create_sc && S.destroy_sc && S.images && S.acquire && S.present;
     rt_log("dlssg: %s", S.active ? "DLSS Frame Generation on the swapchain" : "the swapchain hooks are missing: off");
-    if (S.active) S.reflex(reflex_mode());
+    if (S.active) {
+        S.reflex(reflex_mode());
+        __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);   // DLAA keeps the picture from before the HUD
+    }
 }
 
 int vk_dlssg_active(void) { return S.active; }
@@ -257,11 +269,19 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
 // and the sleep would wait out Streamline's half-second timeout each frame.
 #define HOLD_IDLE_NS 200000000ull
 
-// Turning generation on or off is an slDLSSGSetOptions call and Streamline's own rebuild, and it can be seen: around a
-// menu, a fade or a swapchain change the depth and motion-vector views come and go for a frame or two. Following them
-// frame by frame switched generation off and on dozens of times a second (a run logged 32 changes, in pairs, a frame
-// apart), so a change waits until the new state has held for FG_SETTLE_FRAMES frames.
-#define FG_SETTLE_FRAMES 12
+// Turning generation on is an slDLSSGSetOptions call and Streamline's own rebuild, and it can be seen. Around a menu,
+// a fade or a swapchain change the depth and motion-vector views come and go for a frame or two. Following them frame
+// by frame switched generation off and on dozens of times a second (a run logged 32 changes, in pairs, a frame apart),
+// so turning it on waits until depth and motion have held for FG_REARM_FRAMES frames. Twelve frames made every
+// one-frame gap a long hole, and a flicker a frame apart never got back on. Two good frames in a row is enough to
+// return; a flutter that never holds that long stays off, so generation does not switch every frame. Turning it off
+// does not wait. While the views are missing, the same call used to stay on for those frames and hand Streamline null
+// depth and motion: it kept the previous frame's constants and interpolated without either, a flash or a broken
+// picture on every door, fade and load. The frame that lacks them is not generated. Coming back on discards the
+// generator's history, which still describes the picture from before the gap. A present that was not shown
+// (vk_dlssg_held_back) is the same gap: Streamline is still on from the last shown frame, and the next one turns it
+// off before it may come back.
+#define FG_REARM_FRAMES 2
 
 void vk_dlssg_frame_start(void) {
     if (!S.active) return;
@@ -280,26 +300,89 @@ void vk_dlssg_submitted(uint64_t frame) {
 
 void vk_dlssg_present_frame(uint64_t frame) { S.cur = (uint32_t)frame; }
 
+void vk_dlssg_held_back(void) {
+    if (!S.active) return;
+    __atomic_store_n(&S.gap, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);
+}
+
 uint64_t vk_dlssg_shown(void) { return S.active ? S.shown() : 0; }
 
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, VkImage hudless, VkImageView hudless_view, VkFormat hudless_fmt) {
     if (!S.active) return;
-    VkFfxImage d, m;
-    VkImageView dv, mvv;
+    __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);   // the next evaluations keep the picture from before the HUD
+    // A held-back present never reached this function, so Streamline was left on from the previous shown frame, with
+    // no tags for the frames in between. Drop that state before deciding this frame: the next good run starts clean.
+    if (__atomic_exchange_n(&S.gap, 0, __ATOMIC_ACQ_REL)) {
+        S.gaps++;
+        S.mode = 0;
+        S.pending = 0;
+        S.arm_reset = 1;
+        rt_log("dlssg: a frame was held back, generation off until depth and motion hold; history resets when it "
+               "returns (%llu times)", (unsigned long long)S.gaps);
+    }
+    // Native HDR: the game encodes its PQ picture after the HUD is drawn on the linear target. The encode is the
+    // game's, so a copy of DLSS's linear output is not the swapchain's picture without the HUD. Tagging that copy
+    // would make the whole frame look like the HUD. Generation still runs, without that tag, so the HUD is
+    // interpolated. hdr = 1 keeps a linear copy the present encodes the same way as the picture.
+    int native = vk_hdr_native();
+    if (native) {
+        static int told;
+        if (!told++)
+            rt_log("dlssg: native HDR has no picture without the HUD in the swapchain's colours: the game encodes its "
+                   "PQ image after the HUD is drawn, and that encode is not one this path can repeat. Generation runs "
+                   "without that picture, so the HUD is interpolated (hdr = 1 keeps the HUD out)");
+    }
+    VkFfxImage d = {0}, m = {0};
+    VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
     VkDlaaCamera c;
     float jx = 0, jy = 0;
     int reset = 0;
     int have = vk_dlaa_fg_inputs(&d, &m, &jx, &jy, &reset) && vk_dlaa_fg_views(&dv, &mvv) && vk_dlaa_fg_camera(&c);
-    int want = have && !menu_is_open();
-    if (want == S.mode) S.pending = 0;
-    else if (++S.pending >= FG_SETTLE_FRAMES) { S.mode = want; S.pending = 0; }
-    else want = S.mode;   // hold the state it has until the new one stays
-    int on = want, mult = multiplier_wanted();
+    int hud_ok = hudless && hudless_view;
+    int menu = menu_is_open();
+    // Native has no matching picture without the HUD, so that does not gate generation. Where the picture exists
+    // (SDR and hdr = 1), a frame without it is not generated: the HUD would be warped with the scene.
+    int hud_need = !native;
+    int want = have && !menu && (!hud_need || hud_ok);
+    if (!want) {
+        if (S.mode) {
+            S.arm_reset = 1;
+            if (!have) {
+                S.miss++;
+                rt_log("dlssg: frame generation off: depth or motion vectors missing (%llu times)",
+                       (unsigned long long)S.miss);
+            } else if (hud_need && !hud_ok) {
+                S.no_hudless++;
+                rt_log("dlssg: frame generation off: no picture without the HUD (%llu times)",
+                       (unsigned long long)S.no_hudless);
+            }
+        }
+        S.mode = 0;
+        S.pending = 0;
+    } else if (!S.mode) {
+        if (++S.pending >= FG_REARM_FRAMES) {
+            S.mode = 1;
+            S.pending = 0;
+        }
+    } else {
+        S.pending = 0;
+    }
+    int on = S.mode && want;
+    int mult = multiplier_wanted();
     __atomic_store_n(&S.shown_mult, on ? mult : 1, __ATOMIC_RELAXED);   // the pacer's divisor (frame_rate.c)
+    int reset_hist = 0;
+    if (on && S.arm_reset) {
+        reset_hist = 1;
+        S.arm_reset = 0;
+        rt_log("dlssg: frame generation on, generator history reset");
+    }
     Nx2SlImage zd = {d.image, dv, d.format, d.width, d.height, VK_IMAGE_LAYOUT_GENERAL,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
     Nx2SlImage zm = {m.image, mvv, m.format, m.width, m.height, VK_IMAGE_LAYOUT_GENERAL,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
+    Nx2SlImage zh = {hudless, hudless_view, hudless_fmt, ext.width, ext.height, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
     Nx2SlCamera k;
     memset(&k, 0, sizeof k);
     if (have) {
@@ -309,10 +392,22 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
         k.jitter[0] = jx, k.jitter[1] = jy;
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
-        k.reset = reset;
+        k.reset = reset || reset_hist;
     }
-    // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off
-    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
+    if (on && hud_ok) S.hud_frames++;
+    else if (have && !menu && hud_need && !hud_ok) S.no_hudless_frames++;
+    if (++S.presents == 600 || S.presents % 3600 == 0)
+        rt_log("dlssg: %llu presents, generation disabled %llu times for missing depth or motion vectors, %llu times "
+               "for no picture without the HUD, %llu frames with depth and motion but no such picture, %llu with the "
+               "HUD kept out, %llu resumes after a held-back frame",
+               (unsigned long long)S.presents, (unsigned long long)S.miss, (unsigned long long)S.no_hudless,
+               (unsigned long long)S.no_hudless_frames, (unsigned long long)S.hud_frames,
+               (unsigned long long)S.gaps);
+    // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off. Off passes no
+    // tags: Streamline would otherwise look up depth and motion it was not given this frame. The HUD-less tag is
+    // omitted when that picture is missing, including native HDR.
+    S.frame(cb, on ? &zd : NULL, on ? &zm : NULL, on && hud_ok ? &zh : NULL, on ? &k : NULL, ext.width, ext.height,
+            on ? mult - 1 : 0, S.cur);
 }
 
 void vk_dlssg_release(void) {
