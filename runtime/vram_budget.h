@@ -111,11 +111,49 @@ static inline int vram_pack_dest_ok(int device_local, uint64_t dest_block, uint6
     return 1;
 }
 
+// An image that cannot leave its block: multisample, too many mips to copy, registered with DLSS or Streamline,
+// or written in the last `recent` submissions (a render target). last_write 0: never written. last_write ahead of
+// issued: the submission being recorded still writes it.
+static inline int vram_pack_movable(int samples, int levels, int held, uint64_t last_write, uint64_t issued,
+                                   uint64_t recent) {
+    if (samples > 1 || levels > 16 || held) return 0;
+    if (last_write > issued) return 0;
+    if (last_write && recent && issued - last_write < recent) return 0;
+    return 1;
+}
+
+// A block that holds one of those is not a pack target: it can never be emptied, and holding it out of new
+// allocations pushes later images into system memory.
+static inline int vram_pack_block_ok(int any_unmovable, int movable) {
+    return !any_unmovable && movable > 0;
+}
+
+// Two full passes that move nothing: give the block back to the allocator. One pass can be a run of images the
+// upload batch is still writing.
+static inline int vram_pack_give_up(int zero_move_passes) {
+    return zero_move_passes >= 2;
+}
+
+// Where to try next after a device-local create. attempt 0 landed in the excluded block or failed: 1 means retry
+// device-local as its own allocation (the budget gate still applies) before 2, host memory. A move never uses host.
+static inline int vram_place_retry(int attempt, int need_another, int moving) {
+    if (!need_another) return -1;
+    if (attempt <= 0) return 1;
+    if (attempt == 1 && !moving) return 2;
+    return -1;
+}
+
 // How many released images to destroy so the count is at most `cap`. 0 when there is no cap or the count is under it.
 // The images that cost driver memory outside VMA are the ones with no memory of their own; a byte cap does not see them.
 static inline uint32_t vram_released_count_over(uint32_t count, uint32_t cap) {
     if (!cap || count <= cap) return 0;
     return count - cap;
+}
+
+// The count cap drops images whose content exists only in the image. Far from the budget line that brought back
+// black frames, so it runs only once reclaim has started (usage at line - margin or closer).
+static inline int vram_count_drop_now(int near_line, uint32_t count, uint32_t cap) {
+    return near_line && vram_released_count_over(count, cap) > 0;
 }
 
 // Bytes of images to copy off a sparse block this frame. Urgent: a whole block, so it can be empty within a

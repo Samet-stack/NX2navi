@@ -118,6 +118,23 @@ int main(void) {
         CHECK(vram_released_count_over(9022, 2048) == 9022 - 2048, "9000 released images are over a 2048 cap");
         CHECK(vram_released_count_over(2048, 2048) == 0, "at the cap nothing is over");
         CHECK(vram_released_count_over(9000, 0) == 0, "a count cap of 0 does not drop");
+        CHECK(!vram_pack_movable(2, 1, 0, 0, 100, 8), "a multisample image stays in its block");
+        CHECK(!vram_pack_movable(1, 17, 0, 0, 100, 8), "an image with too many mips stays in its block");
+        CHECK(!vram_pack_movable(1, 1, 1, 0, 100, 8), "an image DLSS or Streamline holds stays in its block");
+        CHECK(!vram_pack_movable(1, 1, 0, 99, 100, 8), "an image written in a recent submission stays in its block");
+        CHECK(!vram_pack_movable(1, 1, 0, 101, 100, 8), "an image the open submission writes stays in its block");
+        CHECK(vram_pack_movable(1, 1, 0, 50, 100, 8), "an image last written well before now can move");
+        CHECK(!vram_pack_block_ok(1, 10), "a block with one unmovable image is not a pack target");
+        CHECK(vram_pack_block_ok(0, 4), "a block of only movable images can be a pack target");
+        CHECK(!vram_pack_block_ok(0, 0), "a block with nothing movable is not a pack target");
+        CHECK(!vram_pack_give_up(0) && !vram_pack_give_up(1), "one pass with no move keeps trying");
+        CHECK(vram_pack_give_up(2), "two passes with no move give the block back");
+        CHECK(vram_place_retry(0, 0, 0) == -1, "a device-local image outside the excluded block stays");
+        CHECK(vram_place_retry(0, 1, 0) == 1, "landing in the excluded block retries device-local first");
+        CHECK(vram_place_retry(1, 1, 0) == 2, "host memory is only after the device-local retry fails");
+        CHECK(vram_place_retry(1, 1, 1) == -1, "a move does not fall back to host memory");
+        CHECK(!vram_count_drop_now(0, 9022, 2048), "far from the line the count cap does not drop render targets");
+        CHECK(vram_count_drop_now(1, 9022, 2048), "near the line a count over the cap drops the oldest");
         {
             // Oldest first, including images with no memory of their own: those are the outside-VMA cost.
             struct { uint64_t age, bytes; int live; } rels[] = {

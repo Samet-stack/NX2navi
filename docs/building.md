@@ -447,7 +447,9 @@ A change to the device-local budget gate or to when reclaim starts (`runtime/vra
 of blocks against one sample, when reclaim starts on the recorded session, that packing the trapped free space in
 that model keeps a new block allowed, and that a pack copy is not ordered ahead of an upload still in the
 open batch, and that a released image younger than the long keep is destroyed once usage is on the line, that a move
-back into the block being emptied is refused, and that a count of released images over its cap drops the oldest.
+back into the block being emptied is refused, that a block with an image which cannot move is not a target,
+that two passes with no move give the block back, that a create which lands in the excluded block retries
+device-local before host memory, and that the released-image count cap drops only near the budget line.
 No game files, no GPU.
 
 A change to what writes `nx2navi.ini` outside the game (`launcher/gameini.py`, `installer/ini.py`, `tools/make_game.py`,
