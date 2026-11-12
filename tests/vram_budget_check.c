@@ -79,12 +79,174 @@ int main(void) {
     // Free space inside blocks is not an argument of the gate: the same `used` is refused either way.
     CHECK(vram_allow_block(line, budget, 64ull << 20, margin) == 0, "on the line is refused however much of `used` is free inside blocks");
 
+    // Reclaim starts a margin before a new block is refused.
+    {
+        uint64_t b = 10957ull << 20, m = vram_margin_auto(b);
+        uint64_t used = 10137ull << 20, free_in = 1411ull << 20;   // frame 165600 of the session
+        VramReclaim rc = vram_reclaim(used, b, m, free_in, 0);
+        CHECK(rc.level == 1 && rc.drop && rc.pack && !rc.urgent, "frame 165600 reclaims before the gate (level %d)", rc.level);
+        CHECK(vram_allow_block(used, b, 64ull << 20, m) == 1, "a block at frame 165600 is still allowed");
+        VramReclaim quiet = vram_reclaim(6000ull << 20, b, m, 128ull << 20, 0);
+        CHECK(quiet.level == 0 && !quiet.drop && !quiet.urgent, "6 GiB with little trapped space stays quiet");
+        VramReclaim wall = vram_reclaim(vram_budget_line(b, m), b, m, 0, 0);
+        CHECK(wall.level == 2 && wall.urgent, "on the line the keep-age is off (level %d)", wall.level);
+        CHECK(vram_reclaim(used, b, 0, free_in, 0).level == 0, "margin 0: no reclaim");
+    }
+
+    // The 10-minute session: usage crossed line - margin with ~1 GiB of released textures still held, then sat
+    // on the line while blocks were refused. On the line, or after a refusal, the long keep does not apply.
+    {
+        uint64_t b = 10829ull << 20, m = vram_margin_auto(b);
+        uint64_t used = 10353ull << 20;   // frame 33240: under the line, above line - margin
+        VramReclaim pre = vram_reclaim(used, b, m, 1608ull << 20, 0);
+        CHECK(pre.level >= 1 && pre.pack && !pre.urgent, "line - margin starts reclaim before a refusal (level %d)", pre.level);
+        CHECK(vram_reclaim(used, b, m, 1608ull << 20, 1).urgent, "a block refused this sample drops released images now");
+        uint64_t bon = 10801ull << 20, mon = vram_margin_auto(bon), uon = 10486ull << 20;   // frame 33360
+        VramReclaim on = vram_reclaim(uon, bon, mon, 1328ull << 20, 0);
+        CHECK(on.urgent && vram_drop_goal(uon, bon, mon) > 0, "on the line there is a drop goal");
+        uint64_t stale = 120, keep = 150ull * 60;
+        CHECK(!vram_released_drop(5000, 5000, stale, keep, 0), "under the keep, a young released image stays");
+        CHECK(vram_released_drop(5000, 5000, stale, keep, 1), "on the line the keep-age does not apply");
+        CHECK(!vram_released_drop(10, 10, stale, keep, 1), "a release from this moment stays even on the line");
+        CHECK(vram_released_cap(b, 4) < (991ull << 20), "the default cap is under the 991 MiB that session held");
+        CHECK(vram_pack_budget(64ull << 20, 1) >= (64ull << 20), "urgent packing moves a whole block in a frame");
+        CHECK(vram_pack_budget(64ull << 20, 0) >= (32ull << 20), "otherwise a block empties within two frames");
+        CHECK(!vram_pack_dest_ok(0, 2, 1), "a move into system memory is not a pack");
+        CHECK(!vram_pack_dest_ok(1, 7, 7), "a move back into the block being emptied is not a pack");
+        CHECK(vram_pack_dest_ok(1, 3, 7), "a device-local move into another block is a pack");
+        CHECK(vram_pack_dest_ok(1, 3, 0), "with no block held out, another device block is fine");
+        CHECK(vram_released_count_over(9022, 2048) == 9022 - 2048, "9000 released images are over a 2048 cap");
+        CHECK(vram_released_count_over(2048, 2048) == 0, "at the cap nothing is over");
+        CHECK(vram_released_count_over(9000, 0) == 0, "a count cap of 0 does not drop");
+        CHECK(!vram_pack_movable(2, 1, 0, 0, 100, 8), "a multisample image stays in its block");
+        CHECK(!vram_pack_movable(1, 17, 0, 0, 100, 8), "an image with too many mips stays in its block");
+        CHECK(!vram_pack_movable(1, 1, 1, 0, 100, 8), "an image DLSS or Streamline holds stays in its block");
+        CHECK(!vram_pack_movable(1, 1, 0, 99, 100, 8), "an image written in a recent submission stays in its block");
+        CHECK(!vram_pack_movable(1, 1, 0, 101, 100, 8), "an image the open submission writes stays in its block");
+        CHECK(vram_pack_movable(1, 1, 0, 50, 100, 8), "an image last written well before now can move");
+        CHECK(!vram_pack_block_ok(1, 10), "a block with one unmovable image is not a pack target");
+        CHECK(vram_pack_block_ok(0, 4), "a block of only movable images can be a pack target");
+        CHECK(!vram_pack_block_ok(0, 0), "a block with nothing movable is not a pack target");
+        CHECK(!vram_pack_give_up(0) && !vram_pack_give_up(1), "one pass with no move keeps trying");
+        CHECK(vram_pack_give_up(2), "two passes with no move give the block back");
+        CHECK(vram_place_keep_normal(1) && !vram_place_host(1), "a normal image that fits a hole is not moved to host memory");
+        CHECK(vram_place_release(1, 1), "landing in the excluded block keeps the image and releases the exclusion");
+        CHECK(!vram_place_release(1, 0), "a hole in another block does not release an exclusion");
+        CHECK(!vram_place_keep_normal(0) && vram_place_host(0), "host memory is only when the device allocation failed");
+        CHECK(vram_place_keep_move(1, 0), "a move into another device-local block is kept");
+        CHECK(!vram_place_keep_move(1, 1), "a move back into the excluded block is not kept");
+        CHECK(!vram_place_keep_move(0, 0), "a move into host memory is not kept");
+        CHECK(!vram_count_drop_now(0, 9022, 2048), "far from the line the count cap does not drop render targets");
+        CHECK(vram_count_drop_now(1, 9022, 2048), "near the line a count over the cap drops the oldest");
+        {
+            // Oldest first, including images with no memory of their own: those are the outside-VMA cost.
+            struct { uint64_t age, bytes; int live; } rels[] = {
+                {10, 0, 1}, {4000, 0, 1}, {3000, 80ull << 20, 1}, {5000, 0, 1},
+            };
+            uint32_t count = 4, cap = 2, stale = 120;
+            uint32_t over = vram_released_count_over(count, cap);
+            int guard = 8;
+            while (over && guard--) {
+                int best = -1;
+                for (int i = 0; i < 4; i++) {
+                    if (!rels[i].live || rels[i].age < stale) continue;
+                    if (best < 0 || rels[i].age > rels[best].age) best = i;   // older age value is released earlier
+                }
+                CHECK(best >= 0, "count cap still has an old released image");
+                if (best < 0) break;
+                rels[best].live = 0;
+                count--;
+                over = vram_released_count_over(count, cap);
+            }
+            CHECK(count == cap && !rels[3].live && !rels[1].live && rels[0].live,
+                  "oldest images go first, a just-released one stays, zero-byte ones count");
+        }
+        struct { uint64_t age, bytes; int live; } tex[] = {
+            {5000, 100ull << 20, 1}, {4000, 600ull << 20, 1}, {10, 900ull << 20, 1}, {8000, 50ull << 20, 1},
+        };
+        uint64_t goal = 500ull << 20, freed = 0;
+        int guard = 8;
+        while (freed < goal && guard--) {
+            int best = -1;
+            for (int i = 0; i < 4; i++) {
+                if (!tex[i].live || !vram_released_drop(tex[i].age, tex[i].age, stale, keep, 1)) continue;
+                if (best < 0 || tex[i].bytes > tex[best].bytes) best = i;
+            }
+            CHECK(best >= 0, "pressure still has a released image to drop");
+            if (best < 0) break;
+            freed += tex[best].bytes;
+            tex[best].live = 0;
+        }
+        CHECK(freed >= goal && !tex[1].live && tex[2].live, "largest eligible first, a just-released image stays (freed %llu)",
+              (unsigned long long)(freed >> 20));
+        int aged = 0;
+        for (int i = 0; i < 4; i++)
+            if (vram_released_drop(tex[i].age, tex[i].age, stale, keep, 0)) aged++;
+        CHECK(aged == 0, "the same images are kept while usage is under the line and under the cap");
+    }
+
+    // A pack copy submitted on its own runs before the upload batch is flushed. The upload then writes the image
+    // the copy already read, and that image is destroyed. Appending the copy to the open batch puts it after the upload.
+    CHECK(!vram_pack_ordered(3, 0, 0, 2), "a copy submitted before the open upload batch is unordered");
+    CHECK(vram_pack_ordered(3, 3, 1, 2), "a copy appended after the upload in the open batch is ordered");
+    CHECK(!vram_pack_ordered(3, 3, 0, 2), "a copy before the upload in the same batch is unordered");
+    CHECK(vram_pack_ordered(3, 4, 1, 3), "once the upload batch is submitted, a later batch may copy");
+    CHECK(!vram_pack_ordered(3, 4, 1, 2), "a later batch while the upload batch is still open is unordered");
+    CHECK(vram_pack_ordered(0, 4, 1, 3), "an image with no upload may be copied");
+    {
+        // The runtime's choice: the copy batch is the open one, or the next one when nothing is open, and the copy
+        // is recorded after whatever that batch already holds.
+        uint64_t submitted = 2, open = 3, uploaded = 3;
+        uint64_t copy_batch = open ? open : submitted + 1;
+        CHECK(vram_pack_ordered(uploaded, copy_batch, 1, submitted), "the open batch takes the copy after its upload");
+        submitted = 3, open = 0, uploaded = 3;
+        copy_batch = open ? open : submitted + 1;
+        CHECK(vram_pack_ordered(uploaded, copy_batch, 1, submitted), "a flushed upload may be copied by the next batch");
+        submitted = 2, open = 3, uploaded = 3;
+        CHECK(!vram_pack_ordered(uploaded, 0, 0, submitted), "submitting the copy on its own overtakes the open upload");
+    }
+
     uint64_t bare = simulate(0);
     CHECK(bare > (10957ull << 20), "without the gate the series crosses the budget (peak %.0f MiB)", bare / 1048576.0);
     uint64_t held = simulate(1);
     CHECK(held < (10957ull << 20) - (64ull << 20),
           "with the gate the series stays at least 64 MiB under the budget (peak %.0f MiB)", held / 1048576.0);
     CHECK(held <= bare, "the gate does not raise the peak");
+
+    // Packing trapped free space once reclaim is on, 32 MiB a frame, before the recorded climb.
+    {
+        uint64_t peak = 0, refused = 0, returned = 0;
+        int on = 0;
+        for (int i = 0; i < NSERIES - 1; i++) {
+            uint32_t f0 = SERIES[i].frame, f1 = SERIES[i + 1].frame;
+            for (uint32_t f = f0 + 1; f <= f1; f++) {
+                double t = (double)(f - f0) / (double)(f1 - f0);
+                uint64_t want = (uint64_t)(SERIES[i].used + ((int)SERIES[i + 1].used - (int)SERIES[i].used) * t) << 20;
+                uint64_t budget = (uint64_t)(SERIES[i].budget + ((int)SERIES[i + 1].budget - (int)SERIES[i].budget) * t) << 20;
+                if (!budget) budget = (uint64_t)SERIES[i].budget << 20;
+                uint64_t margin = vram_margin_auto(budget);
+                // Trapped free space in the log: a couple of hundred MiB, then about 1.4 GiB after frame 162000.
+                uint64_t trapped = f < 162000 ? (200ull << 20) : (1400ull << 20);
+                if (returned < trapped) trapped -= returned;
+                else trapped = 0;
+                uint64_t sim = want > returned ? want - returned : 0;
+                VramReclaim rc = vram_reclaim(sim, budget, margin, trapped, 0);
+                if (rc.pack && trapped > (32ull << 20)) {
+                    returned += 32ull << 20;
+                    if (returned > want) returned = want;
+                    sim = want > returned ? want - returned : 0;
+                    on = 1;
+                }
+                if (!vram_allow_block(sim, budget, 64ull << 20, margin)) refused++;
+                if (sim > peak) peak = sim;
+            }
+        }
+        CHECK(on, "packing ran on the series");
+        CHECK(refused == 0, "with packing, a 64 MiB block is never refused (%llu frames would refuse)",
+              (unsigned long long)refused);
+        CHECK(peak < vram_budget_line((10957ull << 20), vram_margin_auto(10957ull << 20)) + (64ull << 20),
+              "packed peak %.0f MiB stays at the line", peak / 1048576.0);
+    }
 
     if (!fails) printf("vram_budget: %d checks passed; simulated peak %.0f MiB with the gate, %.0f MiB without\n",
                        checks, held / 1048576.0, bare / 1048576.0);

@@ -448,9 +448,17 @@ A change to where the lazy write-back is on by default (`runtime/wb_lazy_choice.
 `vk_mem_lazy_decide`) passes `python tests\wb_lazy_check.py`, which builds the header alone and checks the choice and
 its reason by platform, by GPU driver and by what the player set. No game files, no GPU.
 
-A change to the device-local budget gate (`runtime/vram_budget.h`, `runtime/vk_memory.c` `vk_mem_device_alloc_ok`,
-`runtime/vk_vma.cpp`) passes `python tests\vram_budget_check.py`, which builds the header alone and checks the margin,
-a burst of blocks against one sample, and the recorded session that crossed its budget. No game files, no GPU.
+A change to the device-local budget gate or to when reclaim starts (`runtime/vram_budget.h`; the gate is
+`runtime/vk_memory.c` `vk_mem_device_alloc_ok` and `runtime/vk_vma.cpp`, the reclaim is `runtime/vk_texture.c`
+`raw_reclaim`) passes `python tests\vram_budget_check.py`. It builds the header alone and checks the margin, a burst
+of blocks against one sample, when reclaim starts on the recorded session, that packing the trapped free space in
+that model keeps a new block allowed, and that a pack copy is not ordered ahead of an upload still in the
+open batch, and that a released image younger than the long keep is destroyed once usage is on the line, that a move
+back into the block being emptied is refused, that a block with an image which cannot move is not a target,
+that two passes with no move give the block back, that a normal image which lands in the excluded
+block is kept and the exclusion is released, that host memory is only used when the device allocation
+failed, and that the released-image count cap drops only near the budget line.
+No game files, no GPU.
 
 A change to what writes `nx2navi.ini` outside the game (`launcher/gameini.py`, `installer/ini.py`, `tools/make_game.py`,
 `launcher/updater.py`) passes the settings-file tests of `tests\launcher_test.py` (`PlayerIniTest`, and the tests named

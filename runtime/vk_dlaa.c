@@ -553,6 +553,21 @@ static struct {
     int hl_fresh;
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
 
+// Images last handed to DLSS or to Streamline. A pack copy must not replace one: the evaluation and the frame
+// generator keep the VkImage itself, and at 1440p the depth and motion images are each about 15 MB, under the size
+// that gets a block of its own.
+int vk_dlaa_image_held(VkImage image) {
+    if (!image) return 0;
+    if (image == D.jdepth || image == D.last_color || image == D.hl || image == D.hl_srgb) return 1;
+    if (image == D.fg_depth.image || image == D.fg_mv.image) return 1;
+    for (int i = 0; i < DLSS_SIZES; i++) {
+        struct Size *e = &D.sizes[i];
+        if (image == e->out || image == e->mv || image == e->mask) return 1;
+        if (image == e->chars[0] || image == e->chars[1] || image == e->dist[0] || image == e->dist[1]) return 1;
+    }
+    return 0;
+}
+
 // What this frame drew into a D32F depth at least DLAA_SCENE_MIN_W wide before DLSS ran (vk_dlaa_draw), for the line a
 // frame without a camera logs (cam_note); cleared at each present (vk_dlaa_frame).
 static struct {

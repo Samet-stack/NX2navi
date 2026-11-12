@@ -4306,6 +4306,22 @@ VkCommandBuffer vk_upload_begin(void) {
 
 void vk_upload_end(void) { plat_rmutex_unlock(&cmd_lock); }
 
+uint64_t vk_upload_open_seq(void) {
+    plat_once(&cmd_once, cmd_init, NULL);
+    plat_rmutex_lock(&cmd_lock);
+    uint64_t s = open_active ? open_b.seq : 0;
+    plat_rmutex_unlock(&cmd_lock);
+    return s;
+}
+
+uint64_t vk_upload_submitted_seq(void) {
+    plat_once(&cmd_once, cmd_init, NULL);
+    plat_rmutex_lock(&cmd_lock);
+    uint64_t s = open_active ? open_b.seq - 1 : next_seq;
+    plat_rmutex_unlock(&cmd_lock);
+    return s;
+}
+
 // Staging memory comes from a pool of its own that keeps STG_MIN_BLOCKS blocks from its first use (at boot). In the
 // default pools VMA creates a block under the lock of its memory type (VmaBlockVector::Allocate), so a block made by
 // the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
