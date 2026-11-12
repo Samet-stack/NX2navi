@@ -210,14 +210,14 @@ py -I tools\pgo.py merge D:\Games\NX2navi\build-cache --version v111 --toolchain
 par `make_game.py`.
 
 L’exe optimisé, profil + fast. Avec `--toolchain`, le même clang d’llvm-mingw qui a écrit le profil le relit, et son
-`ld.lld` ajoute le LTO mince (section 2). Sans `--toolchain`, c’est le clang UCRT64, sans LTO ; il doit savoir lire le
-format du `.profdata` d’llvm-mingw 20261020 (clang 23), ce qui n’est pas vérifié ici :
+`ld.lld` ajoute le LTO mince (section 2) :
 
 ```bat
 py -I tools\make_game.py --rebuild --fast --march znver4 --pgo D:\src\NX2navi-fast\build\pgo\pgo-v111.profdata --toolchain D:\src\llvm-mingw-20261020-ucrt-x86_64 --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
 ```
 
-Sans llvm-mingw, avec le clang UCRT64 :
+Sans `--toolchain`, c’est le clang UCRT64, sans LTO. Il doit savoir lire le format du `.profdata` écrit par
+llvm-mingw 20261020 (clang 23), ce qui n’est pas vérifié ici :
 
 ```bat
 py -I tools\make_game.py --rebuild --fast --march znver4 --pgo D:\src\NX2navi-fast\build\pgo\pgo-v111.profdata --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
