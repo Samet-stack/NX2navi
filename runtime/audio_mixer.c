@@ -118,8 +118,8 @@ static void note_center_gain(float base, float g) {
     if (g == 1.f)
         rt_log("audio: stereo downmix centre coefficient %.3f (audio_center_gain 1, unchanged)", base);
     else
-        rt_log("audio: stereo downmix centre coefficient %.3f (audio_center_gain %.3f on %.3f); a sample over full "
-               "scale is scaled down to full scale", base * g, g, base);
+        rt_log("audio: stereo downmix centre coefficient %.3f (audio_center_gain %.3f on %.3f); a sample the centre "
+               "would push past full scale keeps the fronts and shortens only the centre", base * g, g, base);
 }
 static unsigned audio_revision(const AudioRenderer *r) { unsigned byte = r->revision >> 24; return byte >= '0' ? byte - '0' : 0; }
 static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
@@ -1226,16 +1226,25 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             } else if (sink->input_count >= 2) { s[0] = ch[0] ? ch[0][k] : 0; s[1] = ch[1] ? ch[1][k] : 0; }
             else s[0] = s[1] = ch[0] ? ch[0][k] : 0;
             raw[2 * k] = s[0] * gain; raw[2 * k + 1] = s[1] * gain;   /* NX2NAVI_AUDIO_DUMP: the front pair before clipping */
-            // A centre boost can sum the pair past full scale. Scale that sample down to full scale so the
-            // boost is not a hard clip. At gain 1 this does not run, and the write below is the old clip.
+            // A louder centre can sum past full scale. Scaling both channels down pulled the music with the voice.
+            // Shorten only the centre addend; the fronts and surrounds stay. At gain 1 this does not run, and the
+            // write below is the old clip. If the fronts alone are already past full scale, that clip still applies.
             if (cg != 1.f && stereo_5) {
-                float a0 = raw[2 * k] < 0 ? -raw[2 * k] : raw[2 * k];
-                float a1 = raw[2 * k + 1] < 0 ? -raw[2 * k + 1] : raw[2 * k + 1];
-                float peak = a0 > a1 ? a0 : a1;
-                if (peak > 1.f && peak == peak) {
-                    float ksc = 1.f / peak;
-                    raw[2 * k] *= ksc;
-                    raw[2 * k + 1] *= ksc;
+                float gc = cf * (ch[2] ? ch[2][k] : 0) * gain;
+                if (gc == gc) {
+                    float b0 = raw[2 * k] - gc, b1 = raw[2 * k + 1] - gc;
+                    float room0 = gc >= 0.f ? 1.f - b0 : -1.f - b0;
+                    float room1 = gc >= 0.f ? 1.f - b1 : -1.f - b1;
+                    float allow = gc >= 0.f ? (room0 < room1 ? room0 : room1) : (room0 > room1 ? room0 : room1);
+                    if (gc >= 0.f) {
+                        if (allow < 0.f) allow = 0.f;
+                        if (gc > allow) gc = allow;
+                    } else {
+                        if (allow > 0.f) allow = 0.f;
+                        if (gc < allow) gc = allow;
+                    }
+                    raw[2 * k] = b0 + gc;
+                    raw[2 * k + 1] = b1 + gc;
                 }
             }
             for (int c = 0; c < oc; c++) {
