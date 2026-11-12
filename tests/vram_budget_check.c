@@ -111,6 +111,36 @@ int main(void) {
         CHECK(vram_released_cap(b, 4) < (991ull << 20), "the default cap is under the 991 MiB that session held");
         CHECK(vram_pack_budget(64ull << 20, 1) >= (64ull << 20), "urgent packing moves a whole block in a frame");
         CHECK(vram_pack_budget(64ull << 20, 0) >= (32ull << 20), "otherwise a block empties within two frames");
+        CHECK(!vram_pack_dest_ok(0, 2, 1), "a move into system memory is not a pack");
+        CHECK(!vram_pack_dest_ok(1, 7, 7), "a move back into the block being emptied is not a pack");
+        CHECK(vram_pack_dest_ok(1, 3, 7), "a device-local move into another block is a pack");
+        CHECK(vram_pack_dest_ok(1, 3, 0), "with no block held out, another device block is fine");
+        CHECK(vram_released_count_over(9022, 2048) == 9022 - 2048, "9000 released images are over a 2048 cap");
+        CHECK(vram_released_count_over(2048, 2048) == 0, "at the cap nothing is over");
+        CHECK(vram_released_count_over(9000, 0) == 0, "a count cap of 0 does not drop");
+        {
+            // Oldest first, including images with no memory of their own: those are the outside-VMA cost.
+            struct { uint64_t age, bytes; int live; } rels[] = {
+                {10, 0, 1}, {4000, 0, 1}, {3000, 80ull << 20, 1}, {5000, 0, 1},
+            };
+            uint32_t count = 4, cap = 2, stale = 120;
+            uint32_t over = vram_released_count_over(count, cap);
+            int guard = 8;
+            while (over && guard--) {
+                int best = -1;
+                for (int i = 0; i < 4; i++) {
+                    if (!rels[i].live || rels[i].age < stale) continue;
+                    if (best < 0 || rels[i].age > rels[best].age) best = i;   // older age value is released earlier
+                }
+                CHECK(best >= 0, "count cap still has an old released image");
+                if (best < 0) break;
+                rels[best].live = 0;
+                count--;
+                over = vram_released_count_over(count, cap);
+            }
+            CHECK(count == cap && !rels[3].live && !rels[1].live && rels[0].live,
+                  "oldest images go first, a just-released one stays, zero-byte ones count");
+        }
         struct { uint64_t age, bytes; int live; } tex[] = {
             {5000, 100ull << 20, 1}, {4000, 600ull << 20, 1}, {10, 900ull << 20, 1}, {8000, 50ull << 20, 1},
         };

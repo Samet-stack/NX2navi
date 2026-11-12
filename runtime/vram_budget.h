@@ -103,6 +103,21 @@ static inline int vram_released_drop(uint64_t since_rel, uint64_t since_samp, ui
     return since_samp >= keep;
 }
 
+// A moved image must stay in device-local memory, and must not land in the block being emptied. That block is the
+// one with the most free space, so a best-fit allocator puts the next image back into it and it never drains.
+static inline int vram_pack_dest_ok(int device_local, uint64_t dest_block, uint64_t avoid_block) {
+    if (!device_local) return 0;
+    if (avoid_block && dest_block == avoid_block) return 0;
+    return 1;
+}
+
+// How many released images to destroy so the count is at most `cap`. 0 when there is no cap or the count is under it.
+// The images that cost driver memory outside VMA are the ones with no memory of their own; a byte cap does not see them.
+static inline uint32_t vram_released_count_over(uint32_t count, uint32_t cap) {
+    if (!cap || count <= cap) return 0;
+    return count - cap;
+}
+
 // Bytes of images to copy off a sparse block this frame. Urgent: a whole block, so it can be empty within a
 // frame. Otherwise half a block, so a block empties within two frames, and at least 16 MiB.
 static inline uint64_t vram_pack_budget(uint64_t block, int urgent) {

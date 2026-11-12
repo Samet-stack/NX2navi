@@ -156,6 +156,7 @@ static uint64_t n_alias_copied, n_alias_upload, n_alias_uninit, n_alias_kept, n_
 // pass was ended, and those that went in the upload batch (no replay recording), since the last perf line.
 static uint64_t n_dinit_inline, n_dinit_inpass, n_dinit_upload;
 static uint32_t submit_epoch = 1;   // bumped per queue submit: draw bindings check a texture's storage once per submit
+static VkDeviceMemory pack_avoid_mem;   // block being emptied: new images must not allocate in it (pack_sparse)
 // The thresholds further down that count presents (STALE_FRAMES, GPU_STALE_FRAMES, OVERWRITTEN_KEEP, DISUSE_FRAMES)
 // were set at 60 presents a second. Without a limit the game presents 85 to 240 a second (a menu), and "120 presents"
 // was then half a second and "30 s without a sample" 7 to 20 s: under memory pressure textures went three times as
@@ -1057,8 +1058,20 @@ static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocati
     vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
     VkMemoryRequirements mr = mr2.memoryRequirements;
     VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+    if (pack_avoid_mem) ai.flags |= VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT;
     int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
              vmaAllocateMemory(c->vma, &mr, &ai, alloc, NULL) == VK_SUCCESS;
+    if (ok) {
+        VmaAllocationInfo placed;
+        VkMemoryPropertyFlags prop = 0;
+        vmaGetAllocationInfo(c->vma, *alloc, &placed);
+        vmaGetAllocationMemoryProperties(c->vma, *alloc, &prop);
+        if (!vram_pack_dest_ok((prop & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+                               (uint64_t)(uintptr_t)placed.deviceMemory, (uint64_t)(uintptr_t)pack_avoid_mem)) {
+            vmaFreeMemory(c->vma, *alloc);
+            ok = 0;
+        }
+    }
     if (ok && vmaBindImageMemory(c->vma, *alloc, img) != VK_SUCCESS) {
         vmaFreeMemory(c->vma, *alloc);
         ok = 0;
@@ -1074,11 +1087,41 @@ static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocati
 // 256 MiB blocks it left a hole the driver went on counting, with the rest of the block, against the budget and the
 // system's commit (0.5 to 1.8 GiB of such free space in a session at 5120x2160), until the block emptied; its own
 // memory goes back when it does.
-static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc) {
+// moving: the image replaces one in the block being emptied. It has to be device-local and in some other block.
+// A normal create may use host memory when that is the only way to stay out of the block being emptied.
+static int image_placed_ok(VkCtx *c, VmaAllocation alloc, int moving) {
+    VmaAllocationInfo placed;
+    VkMemoryPropertyFlags prop = 0;
+    vmaGetAllocationInfo(c->vma, alloc, &placed);
+    vmaGetAllocationMemoryProperties(c->vma, alloc, &prop);
+    int local = (prop & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    if (moving && !local) return 0;
+    if (pack_avoid_mem && placed.deviceMemory == pack_avoid_mem) return 0;
+    return 1;
+}
+
+static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc,
+                          int moving) {
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (moving) ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    if (pack_avoid_mem) ai.flags |= VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT;
     const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, ik);
     if ((known ? known->size : image_size(ci)) >= DEDICATED_MIN) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-    return vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+    VkResult r = vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+    if (r != VK_SUCCESS) return r;
+    if (image_placed_ok(c, *alloc, moving)) return VK_SUCCESS;
+    vmaDestroyImage(c->vma, *img, *alloc);
+    *img = VK_NULL_HANDLE, *alloc = NULL;
+    if (moving) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    // The device hole that fit was the block being emptied. Host memory keeps the image off that block.
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    ai.requiredFlags = 0;
+    r = vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+    if (r != VK_SUCCESS) return r;
+    if (image_placed_ok(c, *alloc, 0)) return VK_SUCCESS;
+    vmaDestroyImage(c->vma, *img, *alloc);
+    *img = VK_NULL_HANDLE, *alloc = NULL;
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
@@ -1243,7 +1286,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     }
     if (!img) {
         if (gpu_only) n_reuse_new++;
-        VkResult r = vma_image(c, &ci, &e->ik, &img, &e->alloc);
+        VkResult r = vma_image(c, &ci, &e->ik, &img, &e->alloc, 0);
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
@@ -2540,9 +2583,14 @@ static void commit_evict(void) {   // tex_lock held, the commit is low and the r
 // apply. NX2NAVI_VRAM_PACK (default on) moves every image out of the emptiest block, a block's worth per frame when
 // usage is on the line, recorded into the upload batch and not waited on.
 static int reclaim_hot;
-static VkDeviceMemory pack_focus, pack_skip;
 static uint64_t pack_frame, pack_left, refused_seen;
 static uint64_t n_raw_rel, n_raw_bytes, n_pack_moves, n_pack_bytes, n_pack_blocks;
+enum { PACK_SCAN = 2048, PACK_NB = 96 };
+static struct { VkDeviceMemory mem; uint64_t sum; int n; } pack_blk[PACK_NB];
+static int pack_nb, pack_phase, focus_n0, focus_seen, focus_moved_n, avoid_hold;
+static uint32_t pack_scan;
+static VkDeviceMemory pack_focus;
+static uint64_t focus_b0, focus_left_b, focus_moved_b;
 
 static int released_keep_s(void) {
     static int s = -1;
@@ -2590,6 +2638,24 @@ static int released_vram_pct(void) {
                     "(NX2NAVI_VRAM_RELEASED_PCT)", p);
     }
     return p;
+}
+
+// How many released images to keep. Each one is a VkImage the driver charges outside VMA (~64 KiB) whether or not
+// it has memory of its own, so a byte cap leaves thousands of them. 0: only RELEASED_HARD. Past this count the
+// oldest go, including ones whose content lives only in the image: a render target the game uses again after that
+// is made empty (a black frame, seen when this was the only rule). Raise the count if that returns.
+static uint32_t released_count_cap(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *v = cfg_value("NX2NAVI_VRAM_RELEASED_COUNT");
+        n = v && *v ? atoi(v) : 2048;
+        if (n < 0) n = 2048;
+        if (n > 16384) n = 16384;
+        if (!n) rt_log("vk: released images have no count cap (NX2NAVI_VRAM_RELEASED_COUNT=0)");
+        else rt_log("vk: released images kept at most %d; past that the oldest go, including ones with no memory of "
+                    "their own (NX2NAVI_VRAM_RELEASED_COUNT). A render target used again after it went is made empty", n);
+    }
+    return (uint32_t)n;
 }
 
 static uint32_t device_blocks(VkCtx *c) {
@@ -2689,7 +2755,7 @@ static int relocate_tex(Tex *e) {
     ci_from_key(&e->ik, &ci);
     VkImage img = VK_NULL_HANDLE;
     VmaAllocation alloc = NULL;
-    if (vma_image(c, &ci, &e->ik, &img, &alloc) != VK_SUCCESS) return 0;
+    if (vma_image(c, &ci, &e->ik, &img, &alloc, 1) != VK_SUCCESS) return 0;
     VmaAllocationInfo ni;
     vmaGetAllocationInfo(c->vma, alloc, &ni);
     int undo = ni.deviceMemory == oldi.deviceMemory || device_blocks(c) > before;
@@ -2760,87 +2826,136 @@ static uint64_t drop_released_bytes(uint64_t goal, int ignore_keep) {
     return freed;
 }
 
-// Move every image out of the emptiest device block, up to *budget bytes this frame. The copy is recorded into
-// the upload batch (relocate_tex), which is submitted before the replay and is not waited on. A block returns to
-// the budget once its last allocation is destroyed, a submission after the copy.
-static int pack_sparse(uint64_t *budget) {
-    if (!pack_on() || !budget || !*budget) return 0;
-    VkCtx *c = vk_ctx();
-    if (!c) return 0;
-    enum { NG = 128, NE = 512 };
-    struct { VkDeviceMemory mem; uint64_t sum; int n; } g[NG];
-    memset(g, 0, sizeof g);
-    int ng = 0;
-    for (uint32_t i = 0; i < by_key.cap; i++) {
-        Tex *e = by_key.vals[i];
-        if (!e || !e->alloc || !e->pub.image || e->bound_to || e->pub.gone) continue;
-        VmaAllocationInfo ai;
-        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
-        if (!ai.deviceMemory) continue;
-        int s = 0;
-        for (; s < ng && g[s].mem != ai.deviceMemory; s++) {}
-        if (s == ng) {
-            if (ng == NG) continue;
-            g[ng].mem = ai.deviceMemory;
-            s = ng++;
+// Oldest released images first, including ones with no memory of their own, until `limit` of them are gone.
+// Those are VkImages the driver keeps outside VMA. A release younger than STALE_FRAMES stays. The list is oldest
+// first, so the first young one ends the walk.
+static int drop_released_count(uint32_t limit) {
+    if (!limit || !rel_head) return 0;
+    uint64_t now = frames_now(), issued = vk_sync_issued();
+    int dropped = 0;
+    for (Tex *e = rel_head; e && dropped < (int)limit; ) {
+        Tex *next = e->rel_next;
+        if (now - e->rel_frame < STALE_FRAMES) break;
+        int busy = e->wr_fence > issued || e->gpu_fence > issued;
+        int held = e->pub.image && vk_dlaa_image_held(e->pub.image);
+        if (e->released && e->pub.image && !busy && !held) {
+            uint64_t b = e->bytes;
+            drop_tex(e, DROP_RAW);
+            dropped++;
+            n_raw_rel++;
+            n_raw_bytes += b;
         }
-        g[s].sum += ai.size;
-        g[s].n++;
+        e = next;
     }
-    uint64_t pref = vk_vma_block_size();
-    int best = -1;
-    uint64_t best_free = 0;
-    for (int i = 0; i < ng; i++) {
-        if (pack_focus && g[i].mem != pack_focus) continue;
-        if (!pack_focus && g[i].mem == pack_skip) continue;
-        if (g[i].n < 1 || !g[i].sum) continue;
-        if (g[i].n == 1 && g[i].sum >= DEDICATED_MIN) continue;   // already its own block
-        if (g[i].sum >= pref) continue;                            // no hole a normal block would have
-        uint64_t freeb = pref - g[i].sum;
-        if (freeb > best_free) best = i, best_free = freeb;
+    return dropped;
+}
+
+// One slice of the texture table per call. The first full pass finds the emptiest block; later passes move its
+// images, up to *budget bytes, and new allocations are kept out of it (pack_avoid_mem) so the hole is not filled
+// again. The block itself is freed by VMA only after the deferred destroy of its last allocation.
+static int pack_sparse(uint64_t *budget) {
+    if (!pack_on()) return 0;
+    VkCtx *c = vk_ctx();
+    if (!c || !by_key.cap) return 0;
+    if (avoid_hold && !pack_focus && --avoid_hold == 0) {
+        rt_log("vk: pack block %llx is no longer held out of new allocations", (unsigned long long)(uintptr_t)pack_avoid_mem);
+        pack_avoid_mem = VK_NULL_HANDLE;
     }
-    if (best < 0) { pack_focus = VK_NULL_HANDLE; return 0; }
-    pack_focus = g[best].mem;
-    static Tex *list[NE];
-    int nl = 0;
-    for (uint32_t i = 0; i < by_key.cap && nl < NE; i++) {
-        Tex *e = by_key.vals[i];
-        if (!e || !e->alloc || !e->pub.image || e->bound_to || e->pub.gone) continue;
-        VmaAllocationInfo ai;
-        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
-        if (ai.deviceMemory == g[best].mem) list[nl++] = e;
+    int moved = 0;
+    uint32_t blocks0 = pack_focus ? device_blocks(c) : 0;
+    int wrapped = 0;
+    for (int n = 0; n < PACK_SCAN; n++) {
+        Tex *e = by_key.vals[pack_scan];
+        if (++pack_scan >= by_key.cap) pack_scan = 0, wrapped = 1;
+        if (e && e->alloc && e->pub.image && !e->bound_to && !e->pub.gone) {
+            VmaAllocationInfo ai;
+            vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+            if (ai.deviceMemory && !pack_focus) {
+                int s = 0;
+                for (; s < pack_nb && pack_blk[s].mem != ai.deviceMemory; s++) {}
+                if (s == pack_nb && pack_nb < PACK_NB) {
+                    pack_blk[pack_nb].mem = ai.deviceMemory;
+                    pack_blk[pack_nb].sum = ai.size;
+                    pack_blk[pack_nb].n = 1;
+                    pack_nb++;
+                } else if (s < pack_nb) {
+                    pack_blk[s].sum += ai.size;
+                    pack_blk[s].n++;
+                }
+            } else if (ai.deviceMemory && ai.deviceMemory == pack_focus) {
+                focus_seen++;
+                focus_left_b += ai.size;
+                if (budget && *budget) {
+                    uint64_t b = e->bytes;
+                    if (relocate_tex(e)) {
+                        moved++;
+                        focus_moved_n++;
+                        focus_moved_b += b;
+                        n_pack_moves++;
+                        n_pack_bytes += b;
+                        *budget = *budget > b ? *budget - b : 0;
+                    }
+                }
+            }
+        }
+        if (wrapped) break;
     }
-    uint32_t blocks0 = device_blocks(c);
-    int moved = 0, failed = 0;
-    uint64_t moved_b = 0;
-    for (int i = 0; i < nl && *budget; i++) {
-        Tex *e = list[i];
-        if (!e || !e->alloc || e->pub.gone) continue;
-        uint64_t b = e->bytes;
-        if (!relocate_tex(e)) { failed++; continue; }
-        moved++;
-        moved_b += b;
-        n_pack_moves++;
-        n_pack_bytes += b;
-        *budget = *budget > b ? *budget - b : 0;
+    if (!wrapped) {
+        if (moved && blocks0) {
+            uint32_t blocks1 = device_blocks(c);
+            if (blocks1 < blocks0) n_pack_blocks += (uint64_t)(blocks0 - blocks1);
+        }
+        return moved;
     }
-    if (!moved) {
-        pack_skip = g[best].mem;   // nothing there could move; try the next emptiest block next time
-        pack_focus = VK_NULL_HANDLE;
-        return 0;
+    if (!pack_focus) {
+        uint64_t pref = vk_vma_block_size();
+        int best = -1;
+        uint64_t best_free = 0;
+        for (int i = 0; i < pack_nb; i++) {
+            if (pack_blk[i].n < 1 || !pack_blk[i].sum || pack_blk[i].sum >= pref) continue;
+            if (pack_blk[i].n == 1 && pack_blk[i].sum >= DEDICATED_MIN) continue;
+            uint64_t freeb = pref - pack_blk[i].sum;
+            if (freeb > best_free) best = i, best_free = freeb;
+        }
+        pack_nb = 0;
+        if (best >= 0) {
+            pack_focus = pack_blk[best].mem;
+            pack_avoid_mem = pack_focus;
+            focus_b0 = pack_blk[best].sum;
+            focus_n0 = pack_blk[best].n;
+            focus_seen = focus_moved_n = 0;
+            focus_left_b = focus_moved_b = 0;
+            pack_phase = 1;
+            rt_log("vk: pack target block %llx: %d textures, %.0f MiB used, %.0f MiB hole in a %.0f MiB block; "
+                   "new images will not allocate here", (unsigned long long)(uintptr_t)pack_focus, focus_n0,
+                   focus_b0 / 1048576.0, best_free / 1048576.0, pref / 1048576.0);
+        }
+        return moved;
     }
-    pack_skip = VK_NULL_HANDLE;
-    if (moved + failed >= nl && failed == 0) pack_focus = VK_NULL_HANDLE;   // every image of the block was moved
+    if (pack_phase == 1) {   // the pass that chose the block did not see the whole table
+        pack_phase = 2;
+        focus_seen = focus_moved_n = 0;
+        focus_left_b = focus_moved_b = 0;
+        return moved;
+    }
     uint32_t blocks1 = device_blocks(c);
-    if (blocks1 < blocks0) n_pack_blocks += (uint64_t)(blocks0 - blocks1);
-    static int logs;
-    if (logs < 12) {
-        logs++;
-        uint64_t left = g[best].sum > moved_b ? g[best].sum - moved_b : 0;
-        rt_log("vk: packed %d images (%.0f MiB) out of the emptiest block (%.0f MiB still in it, %.0f MiB free); "
-               "device blocks %u -> %u", moved, moved_b / 1048576.0, left / 1048576.0,
-               best_free / 1048576.0, blocks0, blocks1);
+    if (blocks0 && blocks1 < blocks0) n_pack_blocks += (uint64_t)(blocks0 - blocks1);
+    uint64_t remain = focus_left_b > focus_moved_b ? focus_left_b - focus_moved_b : 0;
+    rt_log("vk: pack block %llx: before %.0f MiB in %d textures; this pass saw %d (%.0f MiB), moved %d (%.0f MiB), "
+           "%.0f MiB of ours remain; device blocks %u -> %u", (unsigned long long)(uintptr_t)pack_focus,
+           focus_b0 / 1048576.0, focus_n0, focus_seen, focus_left_b / 1048576.0, focus_moved_n,
+           focus_moved_b / 1048576.0, remain / 1048576.0, blocks0, blocks1);
+    if (!focus_seen) {
+        rt_log("vk: pack block %llx: no texture allocations left (started %.0f MiB in %d). Held out of new allocations "
+               "until the deferred destroys finish; it frees only if nothing else still pins it",
+               (unsigned long long)(uintptr_t)pack_focus, focus_b0 / 1048576.0, focus_n0);
+        pack_focus = VK_NULL_HANDLE;
+        pack_phase = 0;
+        avoid_hold = 24;
+        pack_nb = 0;
     }
+    focus_seen = focus_moved_n = 0;
+    focus_left_b = focus_moved_b = 0;
     return moved;
 }
 
@@ -2854,9 +2969,10 @@ static void raw_reclaim(int force) {   // tex_lock held
     refused_seen = refused;
     VramReclaim rc = vram_reclaim(used, budget, margin, free_in, refused_now);
     uint64_t cap = vram_released_cap(budget, released_vram_pct());
+    uint32_t count_over = vram_released_count_over((uint32_t)nreleased, released_count_cap());
     int over = rel_bytes > cap;
-    reclaim_hot = rc.level > 0 || over;
-    if (!rc.level && !over) return;
+    reclaim_hot = rc.level > 0 || over || count_over || pack_focus || pack_avoid_mem;
+    if (!rc.level && !over && !count_over && !pack_focus && !pack_avoid_mem) return;
     uint64_t need = 0;
     if (rc.urgent) need = vram_drop_goal(used, budget, margin);
     if (rel_bytes > cap && rel_bytes - cap > need) need = rel_bytes - cap;
@@ -2872,13 +2988,23 @@ static void raw_reclaim(int force) {   // tex_lock held
                    now ? "" : ", past the keep");
         }
     }
-    if (rc.pack) {
+    if (count_over) {
+        uint32_t step = count_over > 256 ? 256 : count_over;
+        int nd = drop_released_count(step);
+        static int logs;
+        if (nd && logs < 12) {
+            logs++;
+            rt_log("vk: released images were %d, cap %u: destroyed %d oldest, including ones with no memory of their own",
+                   nreleased + nd, released_count_cap(), nd);
+        }
+    }
+    if (rc.pack || pack_focus || pack_avoid_mem) {
         uint64_t frame = frames_now();
         if (frame != pack_frame) {
             pack_frame = frame;
-            pack_left = vram_pack_budget(vk_vma_block_size(), rc.urgent);
+            pack_left = vram_pack_budget(vk_vma_block_size(), rc.urgent || pack_focus);
         }
-        if (pack_left) pack_sparse(&pack_left);
+        pack_sparse(&pack_left);
     }
 }
 
@@ -3172,7 +3298,7 @@ static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
     img_key_of(&ci, &nk);
     VmaAllocation a = NULL;
     VkImage img = suballoc_image(c, &ci, &a);
-    if (!img && vma_image(c, &ci, &nk, &img, &a) != VK_SUCCESS) {
+    if (!img && vma_image(c, &ci, &nk, &img, &a, 0) != VK_SUCCESS) {
         log_limited(&n_failed, "ASTC texture %#llx (%ux%u): no %s image could be made", (unsigned long long)e->pub.addr,
                     e->t.d.width, e->t.d.height, bc == 2 ? "BC1" : "BC3");
         return 0;
