@@ -43,3 +43,32 @@ static inline uint64_t vram_budget_line(uint64_t budget, uint64_t margin) {
     if (margin > budget) margin = budget / 4 ? budget / 4 : budget;
     return budget - margin;
 }
+
+// Reclaim starts before the gate. level 2 is inside the gate's margin (a new block is about to be refused);
+// level 1 is a margin earlier, or when a large amount of free space is trapped inside blocks and raw usage is
+// within 512 MiB of that earlier line. drop: aged released images can be destroyed. pack: move images out of a
+// sparse block so the block can be freed. step: released images one check may destroy.
+typedef struct {
+    int level, drop, pack, step;
+    uint64_t early, line;
+} VramReclaim;
+
+static inline VramReclaim vram_reclaim(uint64_t used, uint64_t budget, uint64_t margin, uint64_t free_inside) {
+    VramReclaim r;
+    r.level = r.drop = r.pack = r.step = 0;
+    r.early = r.line = 0;
+    if (!budget || !margin) return r;
+    if (margin > budget) margin = budget / 4 ? budget / 4 : budget;
+    r.line = budget - margin;
+    r.early = budget > margin * 2 ? budget - margin * 2 : 0;
+    if (used >= r.line) r.level = 2;
+    else if (used >= r.early) r.level = 1;
+    else if (free_inside >= (512ull << 20) && r.early > (512ull << 20) && used >= r.early - (512ull << 20))
+        r.level = 1;
+    if (r.level) {
+        r.drop = 1;
+        r.pack = free_inside >= (128ull << 20);
+        r.step = r.level >= 2 ? 64 : 32;
+    }
+    return r;
+}

@@ -23,6 +23,7 @@
 #include "nvn_tex.h"
 #include "tex.h"
 #include "vk.h"
+#include "vram_budget.h"
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "prof.h"
@@ -648,7 +649,7 @@ static void destroy_tex(Tex *e);
 
 // Why an entry was destroyed (drop_tex), in the order of drop_names.
 enum { DROP_NONE, DROP_MAX, DROP_CAP, DROP_COMMIT, DROP_VRAM, DROP_IDLE_VRAM, DROP_IDLE_COMMIT, DROP_DISUSE,
-       DROP_OVERWRITTEN, DROP_REPLACED, DROP_REUSED, DROP_RANGE, DROP_EXACT, DROP_SHUTDOWN, DROP_N };
+       DROP_OVERWRITTEN, DROP_REPLACED, DROP_REUSED, DROP_RANGE, DROP_EXACT, DROP_SHUTDOWN, DROP_RAW, DROP_N };
 static void drop_tex(Tex *e, int why);
 // How an entry's content started (start_at; Tex.og_start), in the order of start_names.
 enum { START_NEW, START_UPLOAD_LIVE, START_COPY_LIVE, START_COPY_RELEASED, START_EMPTY_LIVE, START_EMPTY_RELEASED,
@@ -1604,7 +1605,7 @@ static const char *const drop_names[DROP_N] = {
     "", "past RELEASED_MAX released entries", "past the released entries' size cap", "under commit pressure",
     "under VRAM pressure", "idle, under VRAM pressure", "idle, under commit pressure", "unsampled (disuse)",
     "overwritten at another address", "replaced by another descriptor at its address", "its image went to another texture",
-    "its storage went", "made whole again (texture detail)", "shutdown"};
+    "its storage went", "made whole again (texture detail)", "shutdown", "released, raw VRAM near the budget"};
 static const char *const start_names[START_N] = {
     "started on its own", "filled from storage over a live entry", "content copied from a live entry",
     "content copied from a released entry", "started empty over a live entry", "started empty over a released entry",
@@ -2520,6 +2521,322 @@ static void commit_evict(void) {   // tex_lock held, the commit is low and the r
     if (freed < COMMIT_EVICT_STEP) evict_disused(COMMIT_EVICT_STEP - freed);
 }
 
+// Aged released images, and images moved out of a sparse device-memory block, once raw usage is near the OS
+// budget. Outside-VMA memory in the long session tracked new VkImages (about 64 KiB each) and did not fall when a
+// few thousand were destroyed ten seconds later, so the count has to come down before that memory is committed for
+// good; a block returns to the budget only when its last allocation leaves. NX2NAVI_TEX_RELEASED_KEEP_S (default
+// 240, 0 off) is how long a released image that nothing sampled is kept. NX2NAVI_VRAM_PACK (default on) moves images
+// into holes in other blocks while the GPU is idle.
+static int reclaim_hot, pack_cool, rel_skip;
+static uint32_t pack_cursor;
+static uint64_t n_raw_rel, n_pack_moves, n_pack_blocks;
+
+static int released_keep_s(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char *v = cfg_value("NX2NAVI_TEX_RELEASED_KEEP_S");
+        s = v && *v ? atoi(v) : 240;
+        if (s < 0) s = 240;
+        if (s > 3600) s = 3600;
+        if (s > 0 && s < 150) {
+            rt_log("vk: NX2NAVI_TEX_RELEASED_KEEP_S=%d is below 150 s: a render target the game used again after two "
+                   "minutes went black at a shorter keep, so 150 stands", s);
+            s = 150;
+        }
+        if (!s)
+            rt_log("vk: released images stay until the existing caps (NX2NAVI_TEX_RELEASED_KEEP_S=0)");
+        else
+            rt_log("vk: released images nothing sampled for %d s are destroyed once raw VRAM is near the budget "
+                   "(%d s once usage is inside the margin) (NX2NAVI_TEX_RELEASED_KEEP_S)", s, s > 150 ? 150 : s);
+    }
+    return s;
+}
+
+static int pack_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_VRAM_PACK");
+        rt_log("vk: sparse VRAM blocks %s (NX2NAVI_VRAM_PACK=0 leaves them)",
+               on ? "are packed while raw usage is near the budget" : "stay");
+    }
+    return on;
+}
+
+static uint32_t device_blocks(VkCtx *c) {
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint32_t n = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            n += vb[h].statistics.blockCount;
+    return n;
+}
+
+// Copy every mip of src onto dst. Both end in GENERAL. The upload batch is the replay's; this uses its own command
+// buffer so a pack does not interleave with a texture upload.
+static int copy_image(VkImage src, VkImage dst, const VkTexImage *t) {
+    VkCtx *c = vk_ctx();
+    if (!c || vk_device_is_lost() || !t->levels || !t->width) return 0;
+    VkImageAspectFlags parts[3];
+    int np = 0;
+    if (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) parts[np++] = VK_IMAGE_ASPECT_COLOR_BIT;
+    if (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) parts[np++] = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) parts[np++] = VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!np) return 0;
+    static VkCommandPool pool;
+    static VkCommandBuffer cb;
+    static VkFence fence;
+    static int ready;
+    if (!ready) {
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                      .queueFamilyIndex = c->gfx_family};
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                          .commandBufferCount = 1};
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateCommandPool(c->device, &pi, NULL, &pool) != VK_SUCCESS) return 0;
+        ai.commandPool = pool;
+        if (vkAllocateCommandBuffers(c->device, &ai, &cb) != VK_SUCCESS ||
+            vkCreateFence(c->device, &fi, NULL, &fence) != VK_SUCCESS) {
+            vkDestroyCommandPool(c->device, pool, NULL);
+            pool = VK_NULL_HANDLE;
+            return 0;
+        }
+        ready = 1;
+    }
+    vkResetCommandBuffer(cb, 0);
+    vkResetFences(c->device, 1, &fence);
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return 0;
+    uint32_t layers = t->type == VK_IMAGE_TYPE_3D ? 1 : (t->layers ? t->layers : 1);
+    VkImageMemoryBarrier2 bars[2] = {
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+         .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = src,
+         .subresourceRange = {t->aspect, 0, t->levels, 0, layers}},
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+         .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = dst,
+         .subresourceRange = {t->aspect, 0, t->levels, 0, layers}}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = bars};
+    vkCmdPipelineBarrier2(cb, &di);
+    uint32_t w = t->width, h = t->height ? t->height : 1, d = t->depth ? t->depth : 1;
+    for (int a = 0; a < np; a++) {
+        VkImageCopy cps[16];
+        uint32_t nc = t->levels < 16 ? t->levels : 16;
+        uint32_t mw = w, mh = h, md = d;
+        for (uint32_t m = 0; m < nc; m++) {
+            cps[m] = (VkImageCopy){0};
+            cps[m].srcSubresource.aspectMask = parts[a];
+            cps[m].srcSubresource.mipLevel = m;
+            cps[m].srcSubresource.layerCount = layers;
+            cps[m].dstSubresource = cps[m].srcSubresource;
+            cps[m].extent = (VkExtent3D){mw ? mw : 1, mh ? mh : 1, t->type == VK_IMAGE_TYPE_3D ? (md ? md : 1) : 1};
+            mw = mw > 1 ? mw >> 1 : 1;
+            mh = mh > 1 ? mh >> 1 : 1;
+            if (t->type == VK_IMAGE_TYPE_3D) md = md > 1 ? md >> 1 : 1;
+        }
+        vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, nc, cps);
+    }
+    VkImageMemoryBarrier2 done = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                  .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                  .image = dst, .subresourceRange = {t->aspect, 0, t->levels, 0, layers}};
+    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &done;
+    vkCmdPipelineBarrier2(cb, &di);
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) {
+        vkResetCommandBuffer(cb, 0);   // drop the recording before the caller destroys dst
+        return 0;
+    }
+    VkCommandBufferSubmitInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &ci};
+    vk_queue_lock();
+    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, fence);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_lost_check(r, "a sparse-block copy");
+        vkResetCommandBuffer(cb, 0);
+        return 0;
+    }
+    r = vkWaitForFences(c->device, 1, &fence, VK_TRUE, 2000000000ull);
+    if (r == VK_SUCCESS) return 1;
+    // The copy may still be reading src and writing dst. Wait it out before the caller destroys dst.
+    vk_queue_lock();
+    vkQueueWaitIdle(c->gfx_queue);
+    vk_queue_unlock();
+    vkResetCommandBuffer(cb, 0);
+    return 0;
+}
+
+static void ci_from_key(const ImgKey *k, VkImageCreateInfo *ci) {
+    *ci = (VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags, .imageType = (VkImageType)k->type,
+                              .format = (VkFormat)k->format, .extent = {k->w, k->h, k->d ? k->d : 1}, .mipLevels = k->levels ? k->levels : 1,
+                              .arrayLayers = k->layers ? k->layers : 1, .samples = (VkSampleCountFlagBits)(k->samples ? k->samples : 1),
+                              .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = k->usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                              .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+}
+
+// Move e's image into a hole in some other block. 0 leaves e as it was. Texture lock held. The GPU is idle.
+static int relocate_tex(Tex *e) {
+    VkCtx *c = vk_ctx();
+    // A dedicated image is its own block: moving it allocates another. One the open submission writes keeps the old
+    // handle in that command buffer, so the copy would miss the write.
+    if (!c || !e->alloc || !e->bytes || e->bytes >= DEDICATED_MIN || !e->pub.image || e->bound_to || e->pub.gone ||
+        e->pub.samples > 1 || e->pub.levels > 16)
+        return 0;
+    uint64_t issued = vk_sync_issued();
+    if (e->wr_fence > issued || e->gpu_fence > issued) return 0;
+    VmaAllocationInfo oldi;
+    vmaGetAllocationInfo(c->vma, e->alloc, &oldi);
+    uint32_t before = device_blocks(c);
+    VkImageCreateInfo ci;
+    ci_from_key(&e->ik, &ci);
+    VkImage img = VK_NULL_HANDLE;
+    VmaAllocation alloc = NULL;
+    if (vma_image(c, &ci, &e->ik, &img, &alloc) != VK_SUCCESS) return 0;
+    VmaAllocationInfo ni;
+    vmaGetAllocationInfo(c->vma, alloc, &ni);
+    int undo = ni.deviceMemory == oldi.deviceMemory || device_blocks(c) > before || !copy_image(e->pub.image, img, &e->pub);
+    if (undo) {
+        vmaDestroyImage(c->vma, img, alloc);
+        return 0;
+    }
+    VkImage gone = e->pub.image;
+    VmaAllocation gone_a = e->alloc;
+    vk_exec_image_gone(gone);   // views, and the HDR record of this image
+    if (e->released) rel_bytes -= e->bytes;
+    e->pub.image = img;
+    e->alloc = alloc;
+    e->bytes = ni.size;
+    if (e->released) rel_bytes += e->bytes;
+    tex_gen_bump(e->key.addr);
+    vk_defer_image(gone, gone_a);
+    return 1;
+}
+
+static int drop_aged_released(int step, uint64_t min_age) {
+    if (step <= 0 || !rel_head) return 0;
+    uint64_t now = frames_now();
+    int dropped = 0, looked = 0, skip = rel_skip;
+    Tex *e = rel_head;
+    while (e && skip > 0) e = e->rel_next, skip--;
+    if (!e) e = rel_head, rel_skip = 0;
+    while (e && dropped < step && looked < 64) {
+        Tex *next = e->rel_next;
+        looked++;
+        uint64_t since_rel = now - e->rel_frame, since_samp = now - e->samp_frame;
+        // Intact and overwritten images are uploaded again when they return. The others are the ones a later draw
+        // still found after about two minutes, so they stay for min_age (the default is 240 s, 150 s inside the margin).
+        uint64_t need = (comes_back_intact(e) || e->overwritten) ? STALE_FRAMES : min_age;
+        if (e->released && since_rel >= STALE_FRAMES && since_samp >= need && e->pub.image) {
+            drop_tex(e, DROP_RAW);
+            dropped++;
+            n_raw_rel++;
+        }
+        e = next;
+    }
+    rel_skip = e ? rel_skip + looked : 0;
+    if (rel_skip > RELEASED_HARD) rel_skip = 0;
+    return dropped;
+}
+
+// Images in the block with the most free space move into holes elsewhere. One block, a few images.
+static int pack_sparse(void) {
+    if (!pack_on() || pack_cool) { if (pack_cool) pack_cool--; return 0; }
+    if (vk_sync_fence_done() < vk_sync_issued()) return 0;
+    VkCtx *c = vk_ctx();
+    if (!c) return 0;
+    enum { NG = 48, NE = 8 };
+    typedef struct { VkDeviceMemory mem; uint64_t sum, end; int n; Tex *e[NE]; } Grp;
+    Grp g[NG];
+    memset(g, 0, sizeof g);
+    int ng = 0;
+    uint32_t start = pack_cursor, seen = 0;
+    for (uint32_t i = 0; i < by_key.cap && seen < 1024; i++) {
+        uint32_t ix = (start + i) % (by_key.cap ? by_key.cap : 1);
+        Tex *e = by_key.vals[ix];
+        seen++;
+        if (!e || !e->alloc || !e->pub.image || e->bound_to || e->pub.gone) continue;
+        VmaAllocationInfo ai;
+        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+        if (!ai.deviceMemory) continue;
+        int s = 0;
+        for (; s < ng && g[s].mem != ai.deviceMemory; s++) {}
+        if (s == ng) {
+            if (ng == NG) continue;
+            g[ng].mem = ai.deviceMemory;
+            s = ng++;
+        }
+        g[s].sum += ai.size;
+        uint64_t end = ai.offset + ai.size;
+        if (end > g[s].end) g[s].end = end;
+        if (g[s].n < NE) g[s].e[g[s].n] = e;
+        g[s].n++;
+    }
+    pack_cursor = by_key.cap ? (start + seen) % by_key.cap : 0;
+    uint64_t pref = vk_vma_block_size();
+    int best = -1;
+    uint64_t best_free = 0;
+    for (int i = 0; i < ng; i++) {
+        if (!g[i].n || !g[i].e[0]) continue;
+        uint64_t bsz = (g[i].n == 1 && g[i].end == g[i].sum && g[i].sum >= (32ull << 20)) ? g[i].sum
+                     : (g[i].end <= pref ? pref : g[i].end);
+        uint64_t freeb = bsz > g[i].sum ? bsz - g[i].sum : 0;
+        if (freeb > best_free && freeb >= (16ull << 20)) best = i, best_free = freeb;
+    }
+    if (best < 0) return 0;
+    uint32_t blocks0 = device_blocks(c);
+    int moved = 0;
+    int nmove = g[best].n < NE ? g[best].n : NE;
+    for (int i = 0; i < nmove; i++) {
+        Tex *e = g[best].e[i];
+        if (!e || !e->alloc || e->pub.gone) continue;
+        if (relocate_tex(e)) moved++, n_pack_moves++;
+        if (moved == 4) break;
+    }
+    if (!moved) { pack_cool = 32; return 0; }
+    uint32_t blocks1 = device_blocks(c);
+    if (blocks1 < blocks0) n_pack_blocks += (uint64_t)(blocks0 - blocks1);
+    static int logs;
+    if (logs < 8) {
+        logs++;
+        rt_log("vk: packed %d images out of a sparse block (%.0f MiB free in it); device blocks %u -> %u",
+               moved, best_free / 1048576.0, blocks0, blocks1);
+    }
+    return moved;
+}
+
+static void raw_reclaim(int force) {   // tex_lock held
+    if (!force && !reclaim_hot) return;
+    uint64_t used = 0, budget = 0, line = 0, free_in = 0;
+    vk_mem_budget_sample(&used, &budget, &line, &free_in, NULL, NULL);
+    if (!budget || !line || budget < line) { reclaim_hot = 0; return; }
+    uint64_t margin = budget - line;
+    VramReclaim rc = vram_reclaim(used, budget, margin, free_in);
+    reclaim_hot = rc.level > 0;
+    if (!rc.level) return;
+    int keep = released_keep_s();
+    if (rc.drop && keep > 0) {
+        int sec = rc.level >= 2 && keep > 150 ? 150 : keep;
+        int step = rc.step > 8 ? 8 : rc.step;   // destroying images is deferred, and a large batch stalls the collector
+        int n = drop_aged_released(step, PRESENTS((uint64_t)sec * 60));
+        static int logs;
+        if (n && logs < 8) {
+            logs++;
+            rt_log("vk: raw VRAM %.0f of %.0f MiB (line %.0f, %.0f free inside blocks): %d released images destroyed, "
+                   "unsampled for %d s", used / 1048576.0, budget / 1048576.0, line / 1048576.0, free_in / 1048576.0, n, sec);
+        }
+    }
+    if (rc.pack && force) pack_sparse();   // a few images, a few times a second: the copy runs on the replay thread
+}
+
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("NX2NAVI_TEX_VRAM_PRESSURE");
@@ -2534,6 +2851,7 @@ static void sweep_pressure(void) {   // tex_lock held
                    "mirror is refused: textures make room only once a mirror was refused", vram_pressure);
     }
     retire_sweep();
+    raw_reclaim((submit_epoch & 7) == 0);
     if (submit_epoch & 7) return;   // the budget and commit queries every 8 submits
     uint64_t used, budget;
     int exact, dropped = 0;
@@ -4065,6 +4383,7 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 void vk_texture_new_submit(void) {
     lock();
     vk_mem_budget_tick((submit_epoch & 7) == 0);   // before this submission allocates: the budget gate's sample
+    vk_pipeline_fast_sweep();
     // the last one walked the pool, or checked its entries by list
     if (pool_by_list || (round_checks && (uint64_t)round_checks * 2 >= pool_slots)) look_round++;
     round_checks = 0, pool_by_list = 0;
@@ -4119,6 +4438,10 @@ void vk_texture_new_submit(void) {
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
         n_reused = n_reuse_new = n_bind_skips = n_restarts = n_overwritten = n_over_drops = 0;
+        rt_log("perf: frame %llu: raw VRAM reclaim: released images destroyed %llu, images moved off sparse blocks %llu, "
+               "device blocks freed %llu", (unsigned long long)f * 60, (unsigned long long)n_raw_rel,
+               (unsigned long long)n_pack_moves, (unsigned long long)n_pack_blocks);
+        n_raw_rel = n_pack_moves = n_pack_blocks = 0;
         rt_log("perf: frame %llu: texture origins: released entries dropped past RELEASED_MAX %llu, replaced by another "
                "descriptor at their address %llu; entries the CPU does not write made without content at an address it "
                "can see: on their own %llu, over a released entry %llu, over a live one %llu; marked slots that met an "

@@ -79,12 +79,61 @@ int main(void) {
     // Free space inside blocks is not an argument of the gate: the same `used` is refused either way.
     CHECK(vram_allow_block(line, budget, 64ull << 20, margin) == 0, "on the line is refused however much of `used` is free inside blocks");
 
+    // Reclaim starts a margin before a new block is refused.
+    {
+        uint64_t b = 10957ull << 20, m = vram_margin_auto(b);
+        uint64_t used = 10137ull << 20, free_in = 1411ull << 20;   // frame 165600 of the session
+        VramReclaim rc = vram_reclaim(used, b, m, free_in);
+        CHECK(rc.level == 1 && rc.drop && rc.pack, "frame 165600 reclaims before the gate (level %d)", rc.level);
+        CHECK(vram_allow_block(used, b, 64ull << 20, m) == 1, "a block at frame 165600 is still allowed");
+        VramReclaim quiet = vram_reclaim(6000ull << 20, b, m, 128ull << 20);
+        CHECK(quiet.level == 0 && !quiet.drop, "6 GiB with little trapped space stays quiet");
+        VramReclaim wall = vram_reclaim(vram_budget_line(b, m), b, m, 0);
+        CHECK(wall.level == 2 && wall.step == 64, "on the line the reclaim step is 64 (level %d)", wall.level);
+        CHECK(vram_reclaim(used, b, 0, free_in).level == 0, "margin 0: no reclaim");
+    }
+
     uint64_t bare = simulate(0);
     CHECK(bare > (10957ull << 20), "without the gate the series crosses the budget (peak %.0f MiB)", bare / 1048576.0);
     uint64_t held = simulate(1);
     CHECK(held < (10957ull << 20) - (64ull << 20),
           "with the gate the series stays at least 64 MiB under the budget (peak %.0f MiB)", held / 1048576.0);
     CHECK(held <= bare, "the gate does not raise the peak");
+
+    // Packing trapped free space once reclaim is on, 32 MiB a frame, before the recorded climb.
+    {
+        uint64_t peak = 0, refused = 0, returned = 0;
+        int on = 0;
+        for (int i = 0; i < NSERIES - 1; i++) {
+            uint32_t f0 = SERIES[i].frame, f1 = SERIES[i + 1].frame;
+            for (uint32_t f = f0 + 1; f <= f1; f++) {
+                double t = (double)(f - f0) / (double)(f1 - f0);
+                uint64_t want = (uint64_t)(SERIES[i].used + ((int)SERIES[i + 1].used - (int)SERIES[i].used) * t) << 20;
+                uint64_t budget = (uint64_t)(SERIES[i].budget + ((int)SERIES[i + 1].budget - (int)SERIES[i].budget) * t) << 20;
+                if (!budget) budget = (uint64_t)SERIES[i].budget << 20;
+                uint64_t margin = vram_margin_auto(budget);
+                // Trapped free space in the log: a couple of hundred MiB, then about 1.4 GiB after frame 162000.
+                uint64_t trapped = f < 162000 ? (200ull << 20) : (1400ull << 20);
+                if (returned < trapped) trapped -= returned;
+                else trapped = 0;
+                uint64_t sim = want > returned ? want - returned : 0;
+                VramReclaim rc = vram_reclaim(sim, budget, margin, trapped);
+                if (rc.pack && trapped > (32ull << 20)) {
+                    returned += 32ull << 20;
+                    if (returned > want) returned = want;
+                    sim = want > returned ? want - returned : 0;
+                    on = 1;
+                }
+                if (!vram_allow_block(sim, budget, 64ull << 20, margin)) refused++;
+                if (sim > peak) peak = sim;
+            }
+        }
+        CHECK(on, "packing ran on the series");
+        CHECK(refused == 0, "with packing, a 64 MiB block is never refused (%llu frames would refuse)",
+              (unsigned long long)refused);
+        CHECK(peak < vram_budget_line((10957ull << 20), vram_margin_auto(10957ull << 20)) + (64ull << 20),
+              "packed peak %.0f MiB stays at the line", peak / 1048576.0);
+    }
 
     if (!fails) printf("vram_budget: %d checks passed; simulated peak %.0f MiB with the gate, %.0f MiB without\n",
                        checks, held / 1048576.0, bare / 1048576.0);
