@@ -446,7 +446,8 @@ A change to the device-local budget gate or to when reclaim starts (`runtime/vra
 `raw_reclaim`) passes `python tests\vram_budget_check.py`. It builds the header alone and checks the margin, a burst
 of blocks against one sample, when reclaim starts on the recorded session, that packing the trapped free space in
 that model keeps a new block allowed, and that a pack copy is not ordered ahead of an upload still in the
-open batch. No game files, no GPU.
+open batch, and that a released image younger than the long keep is destroyed once usage is on the line.
+No game files, no GPU.
 
 A change to what writes `nx2navi.ini` outside the game (`launcher/gameini.py`, `installer/ini.py`, `tools/make_game.py`,
 `launcher/updater.py`) passes the settings-file tests of `tests\launcher_test.py` (`PlayerIniTest`, and the tests named

@@ -44,18 +44,19 @@ static inline uint64_t vram_budget_line(uint64_t budget, uint64_t margin) {
     return budget - margin;
 }
 
-// Reclaim starts before the gate. level 2 is inside the gate's margin (a new block is about to be refused);
-// level 1 is a margin earlier, or when a large amount of free space is trapped inside blocks and raw usage is
-// within 512 MiB of that earlier line. drop: aged released images can be destroyed. pack: move images out of a
-// sparse block so the block can be freed. step: released images one check may destroy.
+// Reclaim starts a margin before the gate (early = line - margin), before a new block is refused.
+// level 2 is on the gate line. urgent: usage is on that line, a block would be refused, or one was refused
+// since the last sample — released images then go with no keep-age. drop: released images can be destroyed.
+// pack: move images out of a sparse block. step: how many the mild path looks at.
 typedef struct {
-    int level, drop, pack, step;
+    int level, drop, pack, step, urgent;
     uint64_t early, line;
 } VramReclaim;
 
-static inline VramReclaim vram_reclaim(uint64_t used, uint64_t budget, uint64_t margin, uint64_t free_inside) {
+static inline VramReclaim vram_reclaim(uint64_t used, uint64_t budget, uint64_t margin, uint64_t free_inside,
+                                       int refused_now) {
     VramReclaim r;
-    r.level = r.drop = r.pack = r.step = 0;
+    r.level = r.drop = r.pack = r.step = r.urgent = 0;
     r.early = r.line = 0;
     if (!budget || !margin) return r;
     if (margin > budget) margin = budget / 4 ? budget / 4 : budget;
@@ -65,12 +66,50 @@ static inline VramReclaim vram_reclaim(uint64_t used, uint64_t budget, uint64_t 
     else if (used >= r.early) r.level = 1;
     else if (free_inside >= (512ull << 20) && r.early > (512ull << 20) && used >= r.early - (512ull << 20))
         r.level = 1;
+    if (used >= r.line || refused_now || !vram_allow_block(used, budget, 64ull << 20, margin)) r.urgent = 1;
+    if (r.urgent && !r.level) r.level = 2;
     if (r.level) {
         r.drop = 1;
-        r.pack = free_inside >= (128ull << 20);
+        r.pack = free_inside >= (128ull << 20) || r.urgent;
         r.step = r.level >= 2 ? 64 : 32;
     }
     return r;
+}
+
+// Bytes of released images to destroy so raw usage falls under line - margin. 0 when it is already under.
+static inline uint64_t vram_drop_goal(uint64_t used, uint64_t budget, uint64_t margin) {
+    if (!budget || !margin) return 0;
+    if (margin > budget) margin = budget / 4 ? budget / 4 : budget;
+    uint64_t early = budget > margin * 2 ? budget - margin * 2 : 0;
+    if (used <= early) return 0;
+    return used - early;
+}
+
+// Own device memory released textures may hold: pct percent of the budget. 0 or a negative pct: no cap.
+static inline uint64_t vram_released_cap(uint64_t budget, int pct) {
+    if (!budget || pct <= 0) return ~(uint64_t)0;
+    if (pct > 50) pct = 50;
+    return budget / 100 * (uint64_t)pct;
+}
+
+// 1 when a released image may be destroyed. ignore_keep: the long keep does not apply (on the line, a refusal,
+// or over the released-memory cap). A release younger than `stale` stays either way: the game takes those back
+// within a frame.
+static inline int vram_released_drop(uint64_t since_rel, uint64_t since_samp, uint64_t stale, uint64_t keep,
+                                    int ignore_keep) {
+    if (since_rel < stale) return 0;
+    if (ignore_keep) return 1;
+    if (!keep) return 0;
+    return since_samp >= keep;
+}
+
+// Bytes of images to copy off a sparse block this frame. Urgent: a whole block, so it can be empty within a
+// frame. Otherwise half a block, so a block empties within two frames, and at least 16 MiB.
+static inline uint64_t vram_pack_budget(uint64_t block, int urgent) {
+    if (!block) block = 64ull << 20;
+    if (urgent) return block;
+    uint64_t half = block / 2;
+    return half < (16ull << 20) ? (16ull << 20) : half;
 }
 
 // A pack copy must not run before an upload that is still only recorded. `uploaded` is the batch that last

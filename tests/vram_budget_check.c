@@ -83,14 +83,56 @@ int main(void) {
     {
         uint64_t b = 10957ull << 20, m = vram_margin_auto(b);
         uint64_t used = 10137ull << 20, free_in = 1411ull << 20;   // frame 165600 of the session
-        VramReclaim rc = vram_reclaim(used, b, m, free_in);
-        CHECK(rc.level == 1 && rc.drop && rc.pack, "frame 165600 reclaims before the gate (level %d)", rc.level);
+        VramReclaim rc = vram_reclaim(used, b, m, free_in, 0);
+        CHECK(rc.level == 1 && rc.drop && rc.pack && !rc.urgent, "frame 165600 reclaims before the gate (level %d)", rc.level);
         CHECK(vram_allow_block(used, b, 64ull << 20, m) == 1, "a block at frame 165600 is still allowed");
-        VramReclaim quiet = vram_reclaim(6000ull << 20, b, m, 128ull << 20);
-        CHECK(quiet.level == 0 && !quiet.drop, "6 GiB with little trapped space stays quiet");
-        VramReclaim wall = vram_reclaim(vram_budget_line(b, m), b, m, 0);
-        CHECK(wall.level == 2 && wall.step == 64, "on the line the reclaim step is 64 (level %d)", wall.level);
-        CHECK(vram_reclaim(used, b, 0, free_in).level == 0, "margin 0: no reclaim");
+        VramReclaim quiet = vram_reclaim(6000ull << 20, b, m, 128ull << 20, 0);
+        CHECK(quiet.level == 0 && !quiet.drop && !quiet.urgent, "6 GiB with little trapped space stays quiet");
+        VramReclaim wall = vram_reclaim(vram_budget_line(b, m), b, m, 0, 0);
+        CHECK(wall.level == 2 && wall.urgent, "on the line the keep-age is off (level %d)", wall.level);
+        CHECK(vram_reclaim(used, b, 0, free_in, 0).level == 0, "margin 0: no reclaim");
+    }
+
+    // The 10-minute session: usage crossed line - margin with ~1 GiB of released textures still held, then sat
+    // on the line while blocks were refused. On the line, or after a refusal, the long keep does not apply.
+    {
+        uint64_t b = 10829ull << 20, m = vram_margin_auto(b);
+        uint64_t used = 10353ull << 20;   // frame 33240: under the line, above line - margin
+        VramReclaim pre = vram_reclaim(used, b, m, 1608ull << 20, 0);
+        CHECK(pre.level >= 1 && pre.pack && !pre.urgent, "line - margin starts reclaim before a refusal (level %d)", pre.level);
+        CHECK(vram_reclaim(used, b, m, 1608ull << 20, 1).urgent, "a block refused this sample drops released images now");
+        uint64_t bon = 10801ull << 20, mon = vram_margin_auto(bon), uon = 10486ull << 20;   // frame 33360
+        VramReclaim on = vram_reclaim(uon, bon, mon, 1328ull << 20, 0);
+        CHECK(on.urgent && vram_drop_goal(uon, bon, mon) > 0, "on the line there is a drop goal");
+        uint64_t stale = 120, keep = 150ull * 60;
+        CHECK(!vram_released_drop(5000, 5000, stale, keep, 0), "under the keep, a young released image stays");
+        CHECK(vram_released_drop(5000, 5000, stale, keep, 1), "on the line the keep-age does not apply");
+        CHECK(!vram_released_drop(10, 10, stale, keep, 1), "a release from this moment stays even on the line");
+        CHECK(vram_released_cap(b, 4) < (991ull << 20), "the default cap is under the 991 MiB that session held");
+        CHECK(vram_pack_budget(64ull << 20, 1) >= (64ull << 20), "urgent packing moves a whole block in a frame");
+        CHECK(vram_pack_budget(64ull << 20, 0) >= (32ull << 20), "otherwise a block empties within two frames");
+        struct { uint64_t age, bytes; int live; } tex[] = {
+            {5000, 100ull << 20, 1}, {4000, 600ull << 20, 1}, {10, 900ull << 20, 1}, {8000, 50ull << 20, 1},
+        };
+        uint64_t goal = 500ull << 20, freed = 0;
+        int guard = 8;
+        while (freed < goal && guard--) {
+            int best = -1;
+            for (int i = 0; i < 4; i++) {
+                if (!tex[i].live || !vram_released_drop(tex[i].age, tex[i].age, stale, keep, 1)) continue;
+                if (best < 0 || tex[i].bytes > tex[best].bytes) best = i;
+            }
+            CHECK(best >= 0, "pressure still has a released image to drop");
+            if (best < 0) break;
+            freed += tex[best].bytes;
+            tex[best].live = 0;
+        }
+        CHECK(freed >= goal && !tex[1].live && tex[2].live, "largest eligible first, a just-released image stays (freed %llu)",
+              (unsigned long long)(freed >> 20));
+        int aged = 0;
+        for (int i = 0; i < 4; i++)
+            if (vram_released_drop(tex[i].age, tex[i].age, stale, keep, 0)) aged++;
+        CHECK(aged == 0, "the same images are kept while usage is under the line and under the cap");
     }
 
     // A pack copy submitted on its own runs before the upload batch is flushed. The upload then writes the image
@@ -138,7 +180,7 @@ int main(void) {
                 if (returned < trapped) trapped -= returned;
                 else trapped = 0;
                 uint64_t sim = want > returned ? want - returned : 0;
-                VramReclaim rc = vram_reclaim(sim, budget, margin, trapped);
+                VramReclaim rc = vram_reclaim(sim, budget, margin, trapped, 0);
                 if (rc.pack && trapped > (32ull << 20)) {
                     returned += 32ull << 20;
                     if (returned > want) returned = want;
