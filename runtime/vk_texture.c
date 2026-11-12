@@ -59,6 +59,8 @@ typedef struct Tex {
     uint64_t retire_due;          // vk_sync_issued once every pool set was taken since (0: not yet); destroyed after it
     int uploaded, released;
     uint64_t up_retry;            // gfx_counters.frames from which an upload that had no memory is tried again (upload)
+    uint64_t up_batch;            // upload batch that last recorded a write to this image (0: none)
+    uint32_t pack_epoch;          // submit_epoch of a pack copy recorded for it; not packed again in that submission
     uint64_t uid;                 // names the entry in its bucket's released set (tex_gen_flip); 0 until its first release
     uint64_t rel_frame;           // gfx_counters.frames when it was released (drop_stale)
     uint32_t back_gap;            // most presents between a release and its taking back so far (stale_after)
@@ -839,6 +841,13 @@ static int depth_init_inline(void) {
     return on;
 }
 
+// The image's last write was recorded into the upload batch that is open now. A pack copy of it has to come later in
+// that same batch: the batch is submitted before the replay, so a copy submitted on its own now would run first.
+static void note_upload(Tex *e) {
+    uint64_t s = vk_upload_open_seq();
+    if (s) e->up_batch = s;
+}
+
 // A new entry's first transition. A reused image goes through it at the replay's current position: earlier commands
 // of the part being recorded may still use the image as the texture it was, and the upload batch runs before the part.
 // So does a new depth or stencil image (depth_init_inline).
@@ -856,6 +865,7 @@ static void init_new(Tex *e) {
     }
     if (ds) n_dinit_upload++;
     init_image(e, vk_upload_begin());
+    note_upload(e);
     vk_upload_end();
 }
 
@@ -2572,43 +2582,17 @@ static uint32_t device_blocks(VkCtx *c) {
     return n;
 }
 
-// Copy every mip of src onto dst. Both end in GENERAL. The upload batch is the replay's; this uses its own command
-// buffer so a pack does not interleave with a texture upload.
-static int copy_image(VkImage src, VkImage dst, const VkTexImage *t) {
-    VkCtx *c = vk_ctx();
-    if (!c || vk_device_is_lost() || !t->levels || !t->width) return 0;
+// Copy every mip of src onto dst, appended to the upload batch. Both end in GENERAL. The batch is what
+// vk_upload_flush submits before the replay, so a copy here runs after every upload already recorded into it and
+// before the replay. It does not submit and does not wait.
+static int copy_into(VkCommandBuffer cb, VkImage src, VkImage dst, const VkTexImage *t) {
+    if (!cb || !t->levels || !t->width) return 0;
     VkImageAspectFlags parts[3];
     int np = 0;
     if (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) parts[np++] = VK_IMAGE_ASPECT_COLOR_BIT;
     if (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) parts[np++] = VK_IMAGE_ASPECT_DEPTH_BIT;
     if (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) parts[np++] = VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!np) return 0;
-    static VkCommandPool pool;
-    static VkCommandBuffer cb;
-    static VkFence fence;
-    static int ready;
-    if (!ready) {
-        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                                      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-                                      .queueFamilyIndex = c->gfx_family};
-        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                          .commandBufferCount = 1};
-        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if (vkCreateCommandPool(c->device, &pi, NULL, &pool) != VK_SUCCESS) return 0;
-        ai.commandPool = pool;
-        if (vkAllocateCommandBuffers(c->device, &ai, &cb) != VK_SUCCESS ||
-            vkCreateFence(c->device, &fi, NULL, &fence) != VK_SUCCESS) {
-            vkDestroyCommandPool(c->device, pool, NULL);
-            pool = VK_NULL_HANDLE;
-            return 0;
-        }
-        ready = 1;
-    }
-    vkResetCommandBuffer(cb, 0);
-    vkResetFences(c->device, 1, &fence);
-    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return 0;
     uint32_t layers = t->type == VK_IMAGE_TYPE_3D ? 1 : (t->layers ? t->layers : 1);
     VkImageMemoryBarrier2 bars[2] = {
         {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -2651,28 +2635,7 @@ static int copy_image(VkImage src, VkImage dst, const VkTexImage *t) {
                                   .image = dst, .subresourceRange = {t->aspect, 0, t->levels, 0, layers}};
     di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &done;
     vkCmdPipelineBarrier2(cb, &di);
-    if (vkEndCommandBuffer(cb) != VK_SUCCESS) {
-        vkResetCommandBuffer(cb, 0);   // drop the recording before the caller destroys dst
-        return 0;
-    }
-    VkCommandBufferSubmitInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &ci};
-    vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, fence);
-    vk_queue_unlock();
-    if (r != VK_SUCCESS) {
-        vk_device_lost_check(r, "a sparse-block copy");
-        vkResetCommandBuffer(cb, 0);
-        return 0;
-    }
-    r = vkWaitForFences(c->device, 1, &fence, VK_TRUE, 2000000000ull);
-    if (r == VK_SUCCESS) return 1;
-    // The copy may still be reading src and writing dst. Wait it out before the caller destroys dst.
-    vk_queue_lock();
-    vkQueueWaitIdle(c->gfx_queue);
-    vk_queue_unlock();
-    vkResetCommandBuffer(cb, 0);
-    return 0;
+    return 1;
 }
 
 static void ci_from_key(const ImgKey *k, VkImageCreateInfo *ci) {
@@ -2683,16 +2646,22 @@ static void ci_from_key(const ImgKey *k, VkImageCreateInfo *ci) {
                               .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
 }
 
-// Move e's image into a hole in some other block. 0 leaves e as it was. Texture lock held. The GPU is idle.
+// Move e's image into a hole in some other block. 0 leaves e as it was. Texture lock held. The copy is appended to
+// the upload batch and is not waited for: the replay thread does not block on the GPU.
 static int relocate_tex(Tex *e) {
     VkCtx *c = vk_ctx();
     // A dedicated image is its own block: moving it allocates another. One the open submission writes keeps the old
-    // handle in that command buffer, so the copy would miss the write.
+    // handle in that command buffer, so the copy would miss the write. DLSS and Streamline keep the depth and motion
+    // images themselves (about 15 MB each at 1440p, under that size).
     if (!c || !e->alloc || !e->bytes || e->bytes >= DEDICATED_MIN || !e->pub.image || e->bound_to || e->pub.gone ||
-        e->pub.samples > 1 || e->pub.levels > 16)
+        e->pub.samples > 1 || e->pub.levels > 16 || e->pack_epoch == submit_epoch || vk_dlaa_image_held(e->pub.image))
         return 0;
     uint64_t issued = vk_sync_issued();
     if (e->wr_fence > issued || e->gpu_fence > issued) return 0;
+    uint64_t open = vk_upload_open_seq();
+    uint64_t submitted = vk_upload_submitted_seq();
+    uint64_t copy_batch = open ? open : submitted + 1;
+    if (!vram_pack_ordered(e->up_batch, copy_batch, 1, submitted)) return 0;
     VmaAllocationInfo oldi;
     vmaGetAllocationInfo(c->vma, e->alloc, &oldi);
     uint32_t before = device_blocks(c);
@@ -2703,11 +2672,20 @@ static int relocate_tex(Tex *e) {
     if (vma_image(c, &ci, &e->ik, &img, &alloc) != VK_SUCCESS) return 0;
     VmaAllocationInfo ni;
     vmaGetAllocationInfo(c->vma, alloc, &ni);
-    int undo = ni.deviceMemory == oldi.deviceMemory || device_blocks(c) > before || !copy_image(e->pub.image, img, &e->pub);
+    int undo = ni.deviceMemory == oldi.deviceMemory || device_blocks(c) > before;
+    if (!undo) {
+        VkCommandBuffer cb = vk_upload_begin();
+        uint64_t now = vk_upload_open_seq();
+        // begin may have opened the batch the check predicted, or returned the one already open
+        undo = !vram_pack_ordered(e->up_batch, now, 1, vk_upload_submitted_seq()) || !copy_into(cb, e->pub.image, img, &e->pub);
+        vk_upload_end();
+    }
     if (undo) {
         vmaDestroyImage(c->vma, img, alloc);
         return 0;
     }
+    e->pack_epoch = submit_epoch;
+    e->up_batch = 0;   // the copy wrote the new image; a later upload in this batch is recorded after it and stamps it
     VkImage gone = e->pub.image;
     VmaAllocation gone_a = e->alloc;
     vk_exec_image_gone(gone);   // views, and the HDR record of this image
@@ -2732,8 +2710,9 @@ static int drop_aged_released(int step, uint64_t min_age) {
         Tex *next = e->rel_next;
         looked++;
         uint64_t since_rel = now - e->rel_frame, since_samp = now - e->samp_frame;
-        // Intact and overwritten images are uploaded again when they return. The others are the ones a later draw
-        // still found after about two minutes, so they stay for min_age (the default is 240 s, 150 s inside the margin).
+        // Intact and overwritten images are uploaded again when they return. The others include render targets a
+        // later draw still found after about two minutes: dropping one sooner draws it black until the game creates
+        // it again. min_age stays at least 150 s (the default is 240, and 150 once usage is inside the margin).
         uint64_t need = (comes_back_intact(e) || e->overwritten) ? STALE_FRAMES : min_age;
         if (e->released && since_rel >= STALE_FRAMES && since_samp >= need && e->pub.image) {
             drop_tex(e, DROP_RAW);
@@ -2750,6 +2729,7 @@ static int drop_aged_released(int step, uint64_t min_age) {
 // Images in the block with the most free space move into holes elsewhere. One block, a few images.
 static int pack_sparse(void) {
     if (!pack_on() || pack_cool) { if (pack_cool) pack_cool--; return 0; }
+    // Already idle, or not at all. Waiting here held the replay thread for the copy of every image in the pass.
     if (vk_sync_fence_done() < vk_sync_issued()) return 0;
     VkCtx *c = vk_ctx();
     if (!c) return 0;
@@ -3380,6 +3360,7 @@ static void upload(Tex *e) {
             vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, k1 - k0, rg + k0);
         }
         barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        note_upload(e);
         vk_upload_end();
     }
     if (parts > 1)
@@ -4650,6 +4631,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     else if (done <= 0) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
                                 (unsigned long long)e->pub.addr);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    note_upload(e);
     vk_upload_end();
     vk_upload_flush(1);
     free(rg);

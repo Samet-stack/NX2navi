@@ -3890,7 +3890,7 @@ static int fast_enqueue(VkPipeline pipe) {
     return 1;
 }
 
-static int fast_take(int all, VkPipeline *local, int cap) {
+static int fast_retire_take(int all, VkPipeline *local, int cap) {
     uint64_t done = vk_sync_fence_done();
     int n = 0, w = 0;
     plat_mutex_lock(&fast_mu);
@@ -3918,7 +3918,7 @@ static void fast_destroy(VkPipeline *local, int n) {
 void vk_pipeline_fast_sweep(void) {
     if (!P.device) return;
     VkPipeline local[32];
-    fast_destroy(local, fast_take(0, local, 32));
+    fast_destroy(local, fast_retire_take(0, local, 32));
 }
 
 // The whole build of job j, which the caller took off its queue, and the job's end: its pipeline is entered, the
@@ -6979,7 +6979,7 @@ void vk_pipeline_shutdown(void) {
     vkDeviceWaitIdle(P.device);
     VkPipeline retired[64];
     for (;;) {
-        int nr = fast_take(1, retired, 64);
+        int nr = fast_retire_take(1, retired, 64);
         fast_destroy(retired, nr);
         if (nr < 64) break;
     }

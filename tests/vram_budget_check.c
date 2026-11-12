@@ -93,6 +93,27 @@ int main(void) {
         CHECK(vram_reclaim(used, b, 0, free_in).level == 0, "margin 0: no reclaim");
     }
 
+    // A pack copy submitted on its own runs before the upload batch is flushed. The upload then writes the image
+    // the copy already read, and that image is destroyed. Appending the copy to the open batch puts it after the upload.
+    CHECK(!vram_pack_ordered(3, 0, 0, 2), "a copy submitted before the open upload batch is unordered");
+    CHECK(vram_pack_ordered(3, 3, 1, 2), "a copy appended after the upload in the open batch is ordered");
+    CHECK(!vram_pack_ordered(3, 3, 0, 2), "a copy before the upload in the same batch is unordered");
+    CHECK(vram_pack_ordered(3, 4, 1, 3), "once the upload batch is submitted, a later batch may copy");
+    CHECK(!vram_pack_ordered(3, 4, 1, 2), "a later batch while the upload batch is still open is unordered");
+    CHECK(vram_pack_ordered(0, 4, 1, 3), "an image with no upload may be copied");
+    {
+        // The runtime's choice: the copy batch is the open one, or the next one when nothing is open, and the copy
+        // is recorded after whatever that batch already holds.
+        uint64_t submitted = 2, open = 3, uploaded = 3;
+        uint64_t copy_batch = open ? open : submitted + 1;
+        CHECK(vram_pack_ordered(uploaded, copy_batch, 1, submitted), "the open batch takes the copy after its upload");
+        submitted = 3, open = 0, uploaded = 3;
+        copy_batch = open ? open : submitted + 1;
+        CHECK(vram_pack_ordered(uploaded, copy_batch, 1, submitted), "a flushed upload may be copied by the next batch");
+        submitted = 2, open = 3, uploaded = 3;
+        CHECK(!vram_pack_ordered(uploaded, 0, 0, submitted), "submitting the copy on its own overtakes the open upload");
+    }
+
     uint64_t bare = simulate(0);
     CHECK(bare > (10957ull << 20), "without the gate the series crosses the budget (peak %.0f MiB)", bare / 1048576.0);
     uint64_t held = simulate(1);

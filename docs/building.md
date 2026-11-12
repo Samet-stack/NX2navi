@@ -444,8 +444,9 @@ its reason by platform, by GPU driver and by what the player set. No game files,
 A change to the device-local budget gate or to when reclaim starts (`runtime/vram_budget.h`; the gate is
 `runtime/vk_memory.c` `vk_mem_device_alloc_ok` and `runtime/vk_vma.cpp`, the reclaim is `runtime/vk_texture.c`
 `raw_reclaim`) passes `python tests\vram_budget_check.py`. It builds the header alone and checks the margin, a burst
-of blocks against one sample, when reclaim starts on the recorded session, and that packing the trapped free space in
-that model keeps a new block allowed. No game files, no GPU.
+of blocks against one sample, when reclaim starts on the recorded session, that packing the trapped free space in
+that model keeps a new block allowed, and that a pack copy is not ordered ahead of an upload still in the
+open batch. No game files, no GPU.
 
 A change to what writes `nx2navi.ini` outside the game (`launcher/gameini.py`, `installer/ini.py`, `tools/make_game.py`,
 `launcher/updater.py`) passes the settings-file tests of `tests\launcher_test.py` (`PlayerIniTest`, and the tests named

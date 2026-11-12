@@ -72,3 +72,15 @@ static inline VramReclaim vram_reclaim(uint64_t used, uint64_t budget, uint64_t 
     }
     return r;
 }
+
+// A pack copy must not run before an upload that is still only recorded. `uploaded` is the batch that last
+// recorded a write to the image (0 if none). `copy_batch` is the batch the copy is recorded into.
+// `copy_after_upload` is 1 when that copy is later in the same batch than the upload. `submitted` is the highest
+// batch already handed to the queue. A copy in an earlier batch, or in a later batch while the upload's batch is
+// still open, reads the image before the upload and the upload then lands on the image about to be destroyed.
+static inline int vram_pack_ordered(uint64_t uploaded, uint64_t copy_batch, int copy_after_upload, uint64_t submitted) {
+    if (!uploaded) return 1;
+    if (copy_batch < uploaded) return 0;
+    if (copy_batch == uploaded) return copy_after_upload;
+    return uploaded <= submitted;
+}

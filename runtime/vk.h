@@ -428,6 +428,8 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc);
 // between vk_upload_begin and vk_upload_end; a large request gets a buffer of its own at offset 0.
 void *vk_staging_at(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off);
 uint64_t vk_upload_flush(int wait);
+uint64_t vk_upload_open_seq(void);        // the batch being recorded, 0 when none is open
+uint64_t vk_upload_submitted_seq(void);   // the highest batch already handed to the queue
 // Texture work on the render and replay threads, summed per frame (vk_texture.c vk_texstat_frame, the "texup:" line of
 // NX2NAVI_TEXUP_LOG_MS). vk_texstat_time adds the time since t0 (kern_now_ns) and one event; vk_texstat_add adds events
 // and bytes. Other threads are not counted. CREATE: new texture entries (image, memory, first transition); UPLOAD: the
