@@ -298,6 +298,27 @@
 # draw's pipeline when its state repeats, remember texture descriptors between draws, update descriptors in bulk,
 # skip push constants that did not change.
 # bind_skip = 1
+# 1: a draw does not record the texture-pool descriptor bind again when this command buffer already bound the same set
+# and the pool wrote nothing since. 0 (default) binds it on every draw that is not skipped whole. ab follows the A/B
+# blocks. The pictures must match; the gain on the replay thread is not measured yet.
+# pool_bind_skip = 0
+# 1: after a submission's first texture-pool refresh, later refreshes in that submission are not walked. The draws keep
+# the first refresh's descriptors; a texture registered in the middle of the submission can be missing until the next
+# one. 0 (default) walks them, as before. ab follows the A/B blocks. Look for missing textures before keeping it.
+# pool_mid_skip = 0
+# 1: the pipeline memo skips the full state compare when nothing has written the live pipe since the memo was stored and
+# the fields this draw sets itself (shaders, primitive, restart, feedback) match. Mesh draws still compare. A missed
+# write would keep the previous pipeline (wrong blend, depth or vertex format). 0 (default) compares the whole state.
+# ab follows the A/B blocks. Look at lighting and edges before keeping it.
+# pipe_stamp = 0
+# 1: the quad, line-loop and byte-index lists of a draw are built in one reused buffer. The draw copies them into the
+# command buffer before it returns. 0 (default) allocates and frees each list. ab follows the A/B blocks. A wrong list
+# shows as holes in quads or line loops.
+# ix_reuse = 0
+# 1: a vertex shader that reads no object bank is remembered, so the per-object motion check does not walk its resources
+# again. 0 (default) walks on every indexed draw that reaches the check. ab follows the A/B blocks. A wrong memory
+# leaves a moving object on the camera's motion (a smear). dlaa_objmv = 0 turns the whole check off.
+# mvobj_fast = 0
 # shader_memo = 1
 # 1 flushes every shader cache file to the disk before it is used, as earlier versions did; 0 (default) flushes only
 # the stored game code, which makes shader preparation about twice as fast (a torn file is translated again).

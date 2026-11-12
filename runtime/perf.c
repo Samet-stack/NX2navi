@@ -13,6 +13,7 @@
 #include "perfmon.h"
 #include "prof.h"
 #include "platform/platform.h"
+#include "vk_exec.h"
 
 volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
 
@@ -872,6 +873,7 @@ void perf_present(uint64_t frame) {
                plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6,
                (unsigned long long)dwin[0], dwin[1] / 1e6, (unsigned long long)dwin[2]);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
+    if (n && span) vk_exec_perf_draw_log(frame, n);
     char marks[700];
     if (mark_text(&mk_win, marks, 0, sizeof marks) > 0) rt_log("perf: frame %llu: work in the window%s", (unsigned long long)frame, marks);
     memset(&mk_win, 0, sizeof mk_win);
