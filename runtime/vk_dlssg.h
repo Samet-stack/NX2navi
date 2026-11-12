@@ -47,8 +47,12 @@ int vk_dlssg_multiplier_of(const char *value, int max, const char **why);
 // NULL): 1 when the limit of 2 is nx2navi_dlssg.dll's, a build older than its nx2sl_frames_max, not the GPU's.
 int vk_dlssg_multiplier_max(int *old_dll);
 // The frames the display gets per game frame now: the multiplier while generation runs, 1 while it is off or paused
-// (the menu). frame_rate.c paces the game at the frame limit over it. Any thread.
+// (the menu). A numeric frame limit is not divided by it; only the monitor's rate ("display") is (frame_rate.c). Any thread.
 int vk_dlssg_multiplier(void);
+// 1 when Reflex may hold this frame to the limit: DLSS-G is up, the low-latency mode is on, and a host present went
+// out recently. The acquire and the present then skip their own wait for that limit, unless the GPU fence wait is
+// off (NX2NAVI_ACQUIRE_WAIT=0), which leaves the clock as the only guard on the image (nvn_api_obj.c). Any thread.
+int vk_dlssg_reflex_holding(void);
 // Why DLSS-G runs or not: DLSSG_NOT_WANTED (NX2NAVI_FRAMEGEN was not dlss at start, or no DLSS or FSR 3.1 upscaling),
 // DLSSG_NO_FILES (nx2navi_dlssg.dll, Streamline or its swapchain hooks missing or failing), DLSSG_UNAVAILABLE (Streamline
 // loaded but DLSS-G or a required plugin function was unavailable).

@@ -10,13 +10,17 @@
 // Multi frame generation: NX2NAVI_FRAMEGEN_MULTIPLIER (2, 3 or 4, live) is how many frames the display gets per
 // rendered frame, so one, two or three generated ones. Streamline says how many this GPU and driver can generate
 // (numFramesToGenerateMax: one where only 2x runs, three on an RTX 50); a higher setting is clamped to it with a log
-// line. frame_rate.c divides the frame limit by the multiplier in effect (vk_dlssg_multiplier), so the display gets the
-// limit and the game renders a half, a third or a quarter of it.
+// line. A numeric frame limit counts rendered frames and the generated ones come on top (120 at 2x is 120 drawn and
+// 240 shown). Only "display" is a rate on the screen: the game then draws the monitor's rate over the multiplier
+// (frame_rate.c limit_game_hz), since a frame past the refresh is never seen.
 //
-// DLSS-G needs Reflex, whose low-latency mode paces the game (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost): the
-// game's frame sleeps in Reflex where it starts (its acquire of a window image), and each frame carries the latency
-// markers from that start to the host present, all with the frame's number, the count of the game's presents up to it.
-// The mode is the swapchain's, so it is set again after each one (vk_dlssg_create_swapchain).
+// DLSS-G needs Reflex (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost). While the mode is on, Reflex's sleep at the
+// start of the frame is the frame limit: the cap goes to it in microseconds (frameLimitUs) and the game does not also
+// wait that cap out. The two waits used to stack, so a light scene ran short of the limit and the present, held until
+// the game's own slot, reached Streamline late. Each frame still carries the latency markers from that start to the
+// host present. The mode belongs to the swapchain, so it is set again after each one (vk_dlssg_create_swapchain).
+// While no host present has gone out for a while (the window minimized), Reflex does not sleep and the game's own
+// wait holds the limit, so a quiet menu cannot run away.
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -27,6 +31,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "vk.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
@@ -81,6 +86,8 @@ static int reflex_mode(void) {
     }
     return m;
 }
+
+static void reflex_apply(int recompute);
 
 int vk_dlssg_wanted(void) {
     if (S.wanted < 0) {
@@ -178,7 +185,7 @@ void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {
     S.active = S.create_sc && S.destroy_sc && S.images && S.acquire && S.present;
     rt_log("dlssg: %s", S.active ? "DLSS Frame Generation on the swapchain" : "the swapchain hooks are missing: off");
     if (S.active) {
-        S.reflex(reflex_mode());
+        reflex_apply(1);
         __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);   // DLAA keeps the picture from before the HUD
     }
 }
@@ -245,7 +252,7 @@ PFN_vkGetDeviceProcAddr vk_dlssg_dpa(void) { return S.loaded > 0 && S.gdpa ? S.g
 
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
     VkResult r = S.create_sc(d, ci, NULL, sc);
-    if (r == VK_SUCCESS) S.reflex(reflex_mode());
+    if (r == VK_SUCCESS) reflex_apply(0);   // the mode belongs to this swapchain; the cap is the one last measured
     return r;
 }
 void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc) { S.destroy_sc(d, sc, NULL); }
@@ -262,12 +269,59 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
     return r;
 }
 
-// Reflex holds the frame's start until the time the driver computes from the measured render and queue times, so the
-// game's CPU work ends about when the GPU is free for it; then the frame's first markers. Once a frame: the game may
-// acquire again before it presents. No hold while no host present went out for HOLD_IDLE_NS (the window minimized:
-// gfx_present.c skips the host presents while the game runs on): the driver then has no present to time the frame by,
-// and the sleep would wait out Streamline's half-second timeout each frame.
+// Reflex holds the frame's start until the time the driver computes from the measured render and queue times and from
+// the frame cap it was given, so the game's CPU work ends about when the GPU is free for it; then the frame's first
+// markers. Once a frame: the game may acquire again before it presents. No hold while no host present went out for
+// HOLD_IDLE_NS (the window minimized: gfx_present.c skips the host presents while the game runs on): the driver then
+// has no present to time the frame by, and the sleep would wait out Streamline's half-second timeout each frame. The
+// game's own wait holds the limit during that gap (vk_dlssg_reflex_holding).
 #define HOLD_IDLE_NS 200000000ull
+
+static uint32_t cap_us;    // the cap last given to Reflex, microseconds; 0 is no cap. Under reflex_mu.
+static int reflex_sent;
+static PlatMutex reflex_mu = PLAT_MUTEX_INIT;
+
+// The rendered-frame cap as microseconds for Reflex. 0 when the pacer is not holding frames.
+static uint32_t limit_us(void) {
+    uint64_t ns = frame_step_cap_ns();
+    if (!ns) return 0;
+    uint64_t us = (ns + 500) / 1000;
+    return us > 1000000ull ? 1000000u : (uint32_t)us;
+}
+
+// Sends the mode and the cap. recompute reads the limit (the game thread, and once at device ready); a swapchain
+// rebuild sends the cap already stored so it does not read the limit from the present thread. The stored cap and the
+// send stay together: Streamline's call is not thread safe, and a swapchain rebuild otherwise could put the previous
+// cap back over a new one.
+static void reflex_apply(int recompute) {
+    if (!S.reflex) return;
+    int mode = reflex_mode();
+    uint32_t measured = recompute && mode ? limit_us() : 0;
+    plat_mutex_lock(&reflex_mu);
+    uint32_t us = !mode ? 0 : recompute ? measured : cap_us;
+    int changed = !reflex_sent || us != cap_us;
+    if (recompute && !changed) {
+        plat_mutex_unlock(&reflex_mu);
+        return;
+    }
+    cap_us = us;
+    reflex_sent = 1;
+    S.reflex(mode, us);
+    plat_mutex_unlock(&reflex_mu);
+    if (!recompute || !changed || !mode) return;
+    if (us)
+        rt_log("dlssg: Reflex paces the rendered frames at %.0f fps (the frame limit). While presents keep coming, "
+               "the game does not also wait that out",
+               1e6 / (double)us);
+    else
+        rt_log("dlssg: Reflex paces with no frame cap. While presents keep coming, the game does not also wait");
+}
+
+int vk_dlssg_reflex_holding(void) {
+    if (!S.active || reflex_mode() == 0) return 0;
+    uint64_t hosted = __atomic_load_n(&S.hosted_ns, __ATOMIC_RELAXED);
+    return hosted && kern_now_ns() - hosted < HOLD_IDLE_NS;
+}
 
 // Turning generation on is an slDLSSGSetOptions call and Streamline's own rebuild, and it can be seen. Around a menu,
 // a fade or a swapchain change the depth and motion-vector views come and go for a frame or two. Following them frame
@@ -288,6 +342,7 @@ void vk_dlssg_frame_start(void) {
     uint32_t f = __atomic_load_n(&S.game, __ATOMIC_RELAXED) + 1;
     if (f == S.started) return;
     S.started = f;
+    reflex_apply(1);   // the cap, before the sleep that holds the frame to it
     uint64_t hosted = __atomic_load_n(&S.hosted_ns, __ATOMIC_RELAXED);
     S.sleep(f, hosted && kern_now_ns() - hosted < HOLD_IDLE_NS);
 }
