@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include <atomic>
+#include <mutex>
 
 #include <sl.h>
 #include <sl_consts.h>
@@ -47,6 +48,7 @@ PFN_vkGetDeviceProcAddr p_gdpa;
 int g_available = -1;
 int g_frames = -1;                   // the frames to generate as last set (0 off), -1 before the first nx2sl_frame
 std::atomic<uint32_t> g_max{0};      // numFramesToGenerateMax as Streamline last reported it, 0 before it did
+std::mutex g_reflex_mu;              // slReflexSetOptions is not thread safe (sl_reflex.h)
 uint64_t g_presented, g_shown;
 
 void say(const char *fmt, ...) {
@@ -169,14 +171,28 @@ extern "C" NX2SL_API void nx2sl_log_unavailable(VkPhysicalDevice physical) {
 }
 
 // Streamline sets Reflex's mode on the swapchain it was told of last (VK_NV_low_latency2) and drops it while there is
-// none, so it is set again after each swapchain.
-extern "C" NX2SL_API void nx2sl_reflex(int mode) {
+// none, so it is set again after each swapchain. frame_limit_us is the rendered-frame cap (0 none). Reflex applies it
+// even with the mode off, so the game passes 0 unless it has stopped waiting for that cap itself.
+extern "C" NX2SL_API void nx2sl_reflex(int mode, uint32_t frame_limit_us) {
     if (g_available != 1 || !p_reflex) return;
+    std::lock_guard<std::mutex> lock(g_reflex_mu);
     sl::ReflexOptions o{};
     o.mode = mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : mode ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff;
+    o.frameLimitUs = frame_limit_us;
     sl::Result r = p_reflex(o);
-    static int n;
-    if (n++ < 8) say("dlssg: Reflex low-latency mode %s (%d)", mode == 2 ? "on with boost" : mode ? "on" : "off", (int)r);
+    static int logged_mode = -1;
+    static uint32_t logged_us = ~0u;
+    static int logged_result = -1;
+    if (mode == logged_mode && frame_limit_us == logged_us && (int)r == logged_result) return;
+    logged_mode = mode;
+    logged_us = frame_limit_us;
+    logged_result = (int)r;
+    if (frame_limit_us)
+        say("dlssg: Reflex low-latency mode %s, frame cap %.0f fps (%d)",
+            mode == 2 ? "on with boost" : mode ? "on" : "off", 1e6 / (double)frame_limit_us, (int)r);
+    else
+        say("dlssg: Reflex low-latency mode %s, no frame cap (%d)",
+            mode == 2 ? "on with boost" : mode ? "on" : "off", (int)r);
 }
 
 // The game's simulation and its recording of the frame's commands are one span here: the guest's threads cannot be

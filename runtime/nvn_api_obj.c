@@ -14,6 +14,7 @@
 #include "cfg.h"
 #include "coop_game.h"
 #include "host.h"
+#include "vk_dlssg.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
 #include "nvn_tex.h"
@@ -782,6 +783,17 @@ static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
     return 0;
 }
 
+// NX2NAVI_ACQUIRE_WAIT: 1 (default) waits for this image's newest present, 2 for the newest present of any image,
+// 0 leaves the GPU wait out and the clock is what keeps the CPU from drawing into an image still in use.
+static int acquire_wait_mode(void) {
+    static int acq_wait = -1;
+    if (acq_wait < 0) {   // a number: the on/off reader took every value but 0 for 1, so 2 could not be chosen
+        const char *e = cfg_get("NX2NAVI_ACQUIRE_WAIT");
+        acq_wait = e && (*e == '0' || *e == '2') && !e[1] ? *e - '0' : 1;
+    }
+    return acq_wait;
+}
+
 static void sleep_until(uint64_t deadline) {
     for (;;) {
         uint64_t now = kern_now_ns();
@@ -819,7 +831,11 @@ NVN_API(nvnWindowAcquireTexture) {
     int idx = o->active ? o->next++ % o->active : 0;
     *out = idx;
     uint64_t at = idx < 4 ? o->avail[idx] : 0;
-    if (at) {
+    // While Reflex holds the frame (DLSS frame generation) and the GPU wait below is on, this clock wait would stack
+    // on Reflex's sleep and the rate would fall short of the limit. With the GPU wait off, the clock is the only
+    // thing keeping the CPU off an image the GPU still reads, so it stays.
+    int acq_wait = acquire_wait_mode();
+    if (at && !(vk_dlssg_reflex_holding() && acq_wait)) {
         uint64_t p0 = perf_begin();
         sleep_until(at);
         perf_end(PERF_PACE, p0);
@@ -830,11 +846,6 @@ NVN_API(nvnWindowAcquireTexture) {
     // GPU slowed (frame dump logging), this alone cut Ocarina's NaN frames from 56 to 23 of 61; the wait after a frame's
     // first submission (nvn_api_core.c nvnQueueSubmitCommands) removes the rest. NX2NAVI_ACQUIRE_WAIT=0 leaves it to the
     // clock; =2 waits for the newest present of any image (one frame in flight at most).
-    static int acq_wait = -1;
-    if (acq_wait < 0) {   // a number: the on/off reader took every value but 0 for 1, so 2 could not be chosen
-        const char *e = cfg_get("NX2NAVI_ACQUIRE_WAIT");
-        acq_wait = e && (*e == '0' || *e == '2') && !e[1] ? *e - '0' : 1;
-    }
     uint64_t *fe = img_fence_of(o, idx), want = fe ? *fe : 0;
     if (acq_wait == 2) want = last_present_fence;
     if (acq_wait && want) {
@@ -859,6 +870,8 @@ NVN_API(nvnWindowAcquireTexture) {
 // time comes from the pacer: the back end's present thread holds the host present until then (back-edge pacing, as the
 // Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later the
 // image is free for the next acquire. Added latency: the slack of the frame (period minus its work), as on the Switch.
+// While Reflex holds the frame and the GPU fence wait is on, the host present goes out at once instead: Reflex already
+// waited the limit at the start of the frame.
 NVN_API(nvnQueuePresentTexture) {
     win_t *o = arg_p(c, 1);
     int idx = (int)arg_x(c, 2);
@@ -874,10 +887,17 @@ NVN_API(nvnQueuePresentTexture) {
     __atomic_store_n(&nvn_submits_in_frame, 0, __ATOMIC_RELAXED);
     const tex_t *t = (const tex_t *)o->tex[idx];
     uint64_t period = present_period(o), now = kern_now_ns();
-    uint64_t slot = now + pace(&o->pace, now, period);
-    gfx_backend()->present(t, o->crop, slot);
+    // Reflex's sleep already held this frame to the limit. A second wait here would show the real frame late, so the
+    // generated frames that follow it miss the refresh, and Reflex would count that wait as part of the frame and
+    // sleep again next time. at 0 presents as soon as the blit is submitted. The phase stays current so the game's
+    // own wait, when Reflex stops holding (no present for a while), does not burst.
+    int reflex = vk_dlssg_reflex_holding() && acquire_wait_mode();
+    uint64_t slot;
+    if (reflex) o->pace = now, slot = now;
+    else slot = now + pace(&o->pace, now, period);
+    gfx_backend()->present(t, o->crop, reflex ? 0 : slot);
     o->ticket[idx] = o->presents;
-    o->avail[idx] = slot + period;
+    o->avail[idx] = reflex ? 0 : slot + period;
     uint64_t *fe = img_fence_of(o, idx);
     if (fe) *fe = nvn_fence_last();   // the frame drawn into it (nvnWindowAcquireTexture waits for it)
     last_present_fence = nvn_fence_last();

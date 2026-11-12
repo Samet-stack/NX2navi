@@ -21,7 +21,8 @@
 # there any limit inside its range is even.
 # With frame generation on (framegen, [display]) the limit still counts the frames the game draws, and the generated
 # frames come on top: 60 at 4x is 60 drawn and 240 on screen. Only display counts the frames on screen, so there the
-# game draws the monitor's rate divided by the multiplier.
+# game draws the monitor's rate divided by the multiplier. With framegen = dlss and reflex on (the default), Reflex
+# applies this limit and the game does not wait it out a second time.
 # fps_limit = 60
 # Where RivaTuner Statistics Server is installed and running, the limit goes into its profile for the game's
 # executable and RTSS does the limiting instead of the game; closing the game puts back what the profile held.
@@ -515,6 +516,11 @@
 # Each step adds a little latency, and a display shows no more than its refresh rate. Changes while the game runs
 # take effect at once.
 # framegen_multiplier = 2
+# Reflex while DLSS frame generation runs: 0 off, 1 on, 2 on with boost (the GPU's clocks stay up). While it is on,
+# Reflex holds the game to fps_limit and the game does not also wait that limit out; the wait that keeps an image
+# from being drawn into again while the GPU still reads it stays. 0 puts the limit back on the game's own wait.
+# Read at startup.
+# reflex = 1
 
 # HDR output, two kinds (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management;
 # without it the picture stays SDR, the game's own): hdr = 1 sends the game's scene tone mapped to your display, one

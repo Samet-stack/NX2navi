@@ -100,7 +100,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_LIVE", "display"}, {"HDR_PEAK_NITS", "display"}, {"HDR_GAME_NITS", "display"},
     {"HDR_UI_NITS", "display"}, {"SHADOW_RES", "display"},
     {"DLAA", "display"}, {"FSR4", "display"}, {"FSR4_FG", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_IDLE_FREE", "display"}, {"DLSS_CHAR_MASK", "display"}, {"FXAA", "display"},
-    {"FRAMEGEN", "display"}, {"FRAMEGEN_MULTIPLIER", "display"}, {"FG_MULT", "display"},
+    {"FRAMEGEN", "display"}, {"FRAMEGEN_MULTIPLIER", "display"}, {"FG_MULT", "display"}, {"REFLEX", "display"},
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"COOP", "coop"}, {"COOP_BETA", "coop"}, {"COOP_NAME", "coop"}, {"COOP_SERVER", "coop"}, {"COOP_PORT", "coop"},
@@ -174,6 +174,7 @@ static const CfgMeta metas[] = {
     {"FSR4_FG", "0", "0|1", LIVE},   // vk_fg.cpp use4
     {"FRAMEGEN", "off", "off|fsr3|dlss", LIVE},   // vk_fg.cpp, vk_dlssg.c
     {"FRAMEGEN_MULTIPLIER", "2", "2|3|4", LIVE},   // vk_dlssg.c: frames on screen per rendered frame with DLSS
+    {"REFLEX", "1", "0|1|2", RESTART},   // vk_dlssg.c: 0 off, 1 low latency, 2 low latency with boost
     // the same where DLSS's frame generation runs through NGX itself (gfx_present.c ng_multiplier): 2x to 6x or dynamic
     {"FG_MULT", "2", "2|3|4|5|6|dynamic", LIVE},
     {"DLSS_CHAR_MASK", "65", "0|35|65|100", LIVE}, {"FXAA", "1", "0|1", LIVE},

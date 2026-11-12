@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-#define NX2SL_VERSION 3
+#define NX2SL_VERSION 4
 
 typedef struct {
     VkImage image;
@@ -47,9 +47,11 @@ typedef int (*PFN_nx2sl_available)(void);
 // Optional: log Streamline's support result for frame generation after availability failed (its general check of
 // the system, driver and adapters: Streamline looks at one adapter only when given its LUID, which Vulkan has not).
 typedef void (*PFN_nx2sl_log_unavailable)(VkPhysicalDevice physical);
-// Reflex's low-latency mode, 0 off, 1 on, 2 on with boost: after the device, and after each swapchain the game creates
-// through the interposer (the mode is the swapchain's)
-typedef void (*PFN_nx2sl_reflex)(int mode);
+// Reflex's low-latency mode (0 off, 1 on, 2 on with boost) and the rendered-frame cap in microseconds (0 none).
+// After the device, after each swapchain (the mode belongs to the swapchain), and whenever the cap changes.
+// slReflexSetOptions is not thread safe; the DLL takes one call at a time. While the mode is on, this cap is what
+// holds the game to its frame limit.
+typedef void (*PFN_nx2sl_reflex)(int mode, uint32_t frame_limit_us);
 // Frames are numbered by the game's presents: frame n ends with its n-th present (vk_dlssg.c vk_dlssg_game_present).
 // Where the game starts a frame: with hold, Reflex's sleep, which holds the start until the time the driver computes
 // from the measured render and queue times; then the frame's simulation and render-submit-start markers.
