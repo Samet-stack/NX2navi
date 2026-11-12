@@ -822,7 +822,9 @@ static uint64_t *img_fence_of(const win_t *o, int idx) {
 
 // NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow *w, NVNsync *s, int *index): blocks here, not in the
 // present, until the image's previous present plus one period has passed (the game often presents with a lock held).
-// That is the time the next frame goes to the display, so the image is free as soon as that time is reached.
+// That is the time the next frame goes to the display, so the image is free as soon as that time is reached. While
+// Reflex holds the frame limit, that clock wait is skipped and Reflex sleeps first; the GPU wait below still runs
+// before this returns, so the game still does not draw into an image the GPU has not finished.
 NVN_API(nvnWindowAcquireTexture) {
     win_t *o = arg_p(c, 0);
     sync_t *s = arg_p(c, 1);
@@ -835,11 +837,16 @@ NVN_API(nvnWindowAcquireTexture) {
     // on Reflex's sleep and the rate would fall short of the limit. With the GPU wait off, the clock is the only
     // thing keeping the CPU off an image the GPU still reads, so it stays.
     int acq_wait = acquire_wait_mode();
-    if (at && !(vk_dlssg_reflex_holding() && acq_wait)) {
+    int reflex = vk_dlssg_reflex_holding() && acq_wait;
+    if (at && !reflex) {
         uint64_t p0 = perf_begin();
         sleep_until(at);
         perf_end(PERF_PACE, p0);
     }
+    // Reflex sleeps before the GPU wait, and the wait then falls inside the frame it times. Sleeping after the wait
+    // padded that wait out to the cap again: a frame the GPU was still finishing ran slower than the GPU itself.
+    // The present's blit is already ordered ahead of the next draws (vk_backend.c submit_sync drains it first).
+    if (reflex && gfx_backend()->frame_start) gfx_backend()->frame_start();
     // On the Switch the image comes back only after the display has shown it, which needs the GPU to have finished the
     // frame drawn into it, so the CPU never runs more than the swapchain's depth ahead of the GPU. Here the pacer frees
     // images by the clock alone, so the acquire also waits for the GPU to finish the image's newest present. With the
@@ -856,7 +863,7 @@ NVN_API(nvnWindowAcquireTexture) {
             perf_end(PERF_PACE, p0);
         }
     }
-    if (gfx_backend()->frame_start) gfx_backend()->frame_start();   // the frame's work starts here
+    if (!reflex && gfx_backend()->frame_start) gfx_backend()->frame_start();   // the frame's work starts here
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
     if (s) {
