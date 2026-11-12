@@ -134,13 +134,14 @@ static inline int vram_pack_give_up(int zero_move_passes) {
     return zero_move_passes >= 2;
 }
 
-// Where to try next after a device-local create. attempt 0 landed in the excluded block or failed: 1 means retry
-// device-local as its own allocation (the budget gate still applies) before 2, host memory. A move never uses host.
-static inline int vram_place_retry(int attempt, int need_another, int moving) {
-    if (!need_another) return -1;
-    if (attempt <= 0) return 1;
-    if (attempt == 1 && !moving) return 2;
-    return -1;
+// Smallest-fit tries the emptiest block last. A normal image that still lands there is kept: that hole was the
+// only one that fit, and the exclusion is released so later images are not pushed into system memory. Host memory
+// is only when the device allocation itself failed. A move is kept only when it is device-local and in another block.
+static inline int vram_place_keep_normal(int alloc_ok) { return alloc_ok; }
+static inline int vram_place_host(int alloc_ok) { return !alloc_ok; }
+static inline int vram_place_release(int alloc_ok, int in_excluded) { return alloc_ok && in_excluded; }
+static inline int vram_place_keep_move(int device_local, int in_excluded) {
+    return device_local && !in_excluded;
 }
 
 // How many released images to destroy so the count is at most `cap`. 0 when there is no cap or the count is under it.

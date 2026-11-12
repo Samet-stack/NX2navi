@@ -129,10 +129,13 @@ int main(void) {
         CHECK(!vram_pack_block_ok(0, 0), "a block with nothing movable is not a pack target");
         CHECK(!vram_pack_give_up(0) && !vram_pack_give_up(1), "one pass with no move keeps trying");
         CHECK(vram_pack_give_up(2), "two passes with no move give the block back");
-        CHECK(vram_place_retry(0, 0, 0) == -1, "a device-local image outside the excluded block stays");
-        CHECK(vram_place_retry(0, 1, 0) == 1, "landing in the excluded block retries device-local first");
-        CHECK(vram_place_retry(1, 1, 0) == 2, "host memory is only after the device-local retry fails");
-        CHECK(vram_place_retry(1, 1, 1) == -1, "a move does not fall back to host memory");
+        CHECK(vram_place_keep_normal(1) && !vram_place_host(1), "a normal image that fits a hole is not moved to host memory");
+        CHECK(vram_place_release(1, 1), "landing in the excluded block keeps the image and releases the exclusion");
+        CHECK(!vram_place_release(1, 0), "a hole in another block does not release an exclusion");
+        CHECK(!vram_place_keep_normal(0) && vram_place_host(0), "host memory is only when the device allocation failed");
+        CHECK(vram_place_keep_move(1, 0), "a move into another device-local block is kept");
+        CHECK(!vram_place_keep_move(1, 1), "a move back into the excluded block is not kept");
+        CHECK(!vram_place_keep_move(0, 0), "a move into host memory is not kept");
         CHECK(!vram_count_drop_now(0, 9022, 2048), "far from the line the count cap does not drop render targets");
         CHECK(vram_count_drop_now(1, 9022, 2048), "near the line a count over the cap drops the oldest");
         {
