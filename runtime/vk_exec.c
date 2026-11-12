@@ -101,7 +101,7 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     nfw = 0;
 }
 
-// Deltas of the draw-path counters since the previous call. trace=perf adds the hit counts and the two clocks;
+// Deltas of the draw-path counters since the previous call. trace=perf adds the hit counts and the clocks;
 // trace=gfx also clears the struct at each present, and a counter that went backwards is taken as that clear.
 void vk_exec_perf_draw_log(uint64_t frame, uint64_t nframes) {
     VkExecFrame *f = &vk_exec_frame;
@@ -116,24 +116,40 @@ void vk_exec_perf_draw_log(uint64_t frame, uint64_t nframes) {
     uint64_t d_sig = f->bind_sig_ns >= prev.bind_sig_ns ? f->bind_sig_ns - prev.bind_sig_ns : f->bind_sig_ns;
     uint64_t d_push = f->bind_push_ns >= prev.bind_push_ns ? f->bind_push_ns - prev.bind_push_ns : f->bind_push_ns;
     uint64_t d_ph = f->pipe_hit >= prev.pipe_hit ? f->pipe_hit - prev.pipe_hit : f->pipe_hit;
+    uint64_t d_ps = f->pipe_stamp_hit >= prev.pipe_stamp_hit ? f->pipe_stamp_hit - prev.pipe_stamp_hit : f->pipe_stamp_hit;
     uint64_t d_pm = f->pipe_miss >= prev.pipe_miss ? f->pipe_miss - prev.pipe_miss : f->pipe_miss;
+    uint64_t d_pns = f->pipe_ns >= prev.pipe_ns ? f->pipe_ns - prev.pipe_ns : f->pipe_ns;
     uint64_t d_sh = f->sh_hit >= prev.sh_hit ? f->sh_hit - prev.sh_hit : f->sh_hit;
     uint64_t d_sm = f->sh_miss >= prev.sh_miss ? f->sh_miss - prev.sh_miss : f->sh_miss;
     uint64_t d_pool = f->pool_ns >= prev.pool_ns ? f->pool_ns - prev.pool_ns : f->pool_ns;
     uint64_t d_mv = f->mv_ns >= prev.mv_ns ? f->mv_ns - prev.mv_ns : f->mv_ns;
     uint64_t d_mid = f->pool_mid >= prev.pool_mid ? f->pool_mid - prev.pool_mid : f->pool_mid;
+    uint64_t d_snap = f->snap_ns >= prev.snap_ns ? f->snap_ns - prev.snap_ns : f->snap_ns;
+    uint64_t d_ix = f->ix_n >= prev.ix_n ? f->ix_n - prev.ix_n : f->ix_n;
     prev = *f;
     if (!nframes) return;
     double n = (double)nframes;
+    // tex, buf, sig and push stay 0 unless trace also includes gfx: those clocks sit on every descriptor.
     rt_log("perf: frame %llu: over %llu frames, draws recorded %llu, seen %llu; bind_resources %llu (skipped %llu), "
-           "per frame %.2f ms (tex %.2f, buf %.2f, sig %.2f, push %.2f); pipe memo hit %llu, lookup %llu; "
-           "shader memo hit %llu, miss %llu; pool_sync %.2f ms a frame; motion check %.2f ms a frame; "
-           "mid-submission pool refreshes skipped %llu",
+           "per frame %.2f ms (tex %.2f, buf %.2f, sig %.2f, push %.2f); pipe memo hit %llu (stamp %llu), lookup %llu, "
+           "%.2f ms a frame; shader memo hit %llu, miss %llu; pool_sync %.2f ms a frame; motion check %.2f ms a frame; "
+           "binding snap %.2f ms a frame; index lists %llu; mid-submission pool refreshes skipped %llu",
            (unsigned long long)frame, (unsigned long long)nframes, (unsigned long long)d_draws, (unsigned long long)d_seen,
            (unsigned long long)d_bind, (unsigned long long)d_bskip, d_bns / 1e6 / n, d_tex / 1e6 / n, d_buf / 1e6 / n,
-           d_sig / 1e6 / n, d_push / 1e6 / n, (unsigned long long)d_ph, (unsigned long long)d_pm,
-           (unsigned long long)d_sh, (unsigned long long)d_sm, d_pool / 1e6 / n, d_mv / 1e6 / n,
-           (unsigned long long)d_mid);
+           d_sig / 1e6 / n, d_push / 1e6 / n, (unsigned long long)d_ph, (unsigned long long)d_ps, (unsigned long long)d_pm,
+           d_pns / 1e6 / n, (unsigned long long)d_sh, (unsigned long long)d_sm, d_pool / 1e6 / n, d_mv / 1e6 / n,
+           d_snap / 1e6 / n, (unsigned long long)d_ix, (unsigned long long)d_mid);
+}
+
+void vk_exec_pipe_touch(VkExec *ex) {
+    static uint32_t n = 1;
+    uint32_t v = ++n;
+    if (!v) v = ++n;
+    ex->pipe_stamp = v;
+}
+
+void vk_exec_snap_add(uint64_t ns) {
+    vk_exec_frame.snap_ns += ns;
 }
 
 WEAK void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
@@ -472,6 +488,7 @@ static void resolve_rt(VkExec *ex) {
     ex->pass_ncolor = (uint32_t)n;
     ex->pass_samples = samples ? samples : 1;
     ex->pipe.samples = (uint8_t)ex->pass_samples;
+    vk_exec_pipe_touch(ex);
 }
 
 // The attachment view of a target. A registered texture's view lives as long as its image (vk_exec_target_view); any
@@ -1625,8 +1642,8 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
             memcpy(ex->blend_color, ((const p_blend_color *)a)->rgba, sizeof ex->blend_color);
             ex->dirty |= VK_EXEC_DIRTY_BLEND_CONST;
             break;
-        case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
-        case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
+        case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; vk_exec_pipe_touch(ex); break;
+        case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; vk_exec_pipe_touch(ex); break;
         case OP_PRIM_RESTART: ex->prim_restart = *(const p_prim_restart *)a; break;
         case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;

@@ -3764,7 +3764,9 @@ static void make_fresh_snap(Tex *e) {
     if (!e->uploaded && up_wait(e)) return;
     uint32_t now;
     n_checks++;
+    uint64_t snap_t0 = (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
+    if (snap_t0) vk_exec_snap_add(kern_now_ns() - snap_t0);
     e->wgen = now;
     if (!e->uploaded) { upload(e); return; }
     e->last_ch = ch;
