@@ -19,7 +19,10 @@ void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc);
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img);
 VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, uint32_t *idx);
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
-void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext);   // each present, before its command buffer is submitted
+// Each present, before its command buffer is submitted. hudless is this frame's picture without the HUD, at the
+// swapchain's size and format, in GENERAL (gfx_present.c hudless_record); VK_NULL_HANDLE when there is none. The view
+// may be null only together with the image.
+void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, VkImage hudless, VkImageView hudless_view, VkFormat hudless_fmt);
 // Frames are numbered by the game's presents (frame n ends with the n-th). Reflex's frame timing while active:
 void vk_dlssg_frame_start(void);    // the game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture): Reflex's sleep
 void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_present): counts it
@@ -27,6 +30,9 @@ void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_
 // marker; frame is gfx_counters.frames of its present, the same count
 void vk_dlssg_submitted(uint64_t frame);
 void vk_dlssg_present_frame(uint64_t frame);   // the present thread's next blit and present are of this frame
+// A game present was not shown (vk_backend.c frame_hold: skipped draws, a resize, an area load). The present thread
+// never ran, so Streamline was not told. The next host present turns generation off and discards its history. Any thread.
+void vk_dlssg_held_back(void);
 uint64_t vk_dlssg_shown(void);   // the frames the display got, generated ones included (present thread); 0 when off
 void vk_dlssg_release(void);
 

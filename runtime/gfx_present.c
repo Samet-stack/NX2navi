@@ -907,7 +907,8 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
+    if (!(vk_fg_active() || ng_running() || vk_dlssg_active()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) ||
+        (int)pw != w || (int)ph != h)
         return VK_NULL_HANDLE;
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
@@ -1177,9 +1178,13 @@ static int ng_image(NgImg *im, uint32_t w, uint32_t h, VkFormat f) {
 
 // The presenter and the images for the current swapchain (g_pl held). 0: frames go out the plain way.
 static int ng_ready(void) {
+    // Windows returns below before the NGX presenter wants anything. DLSS-G on that path still needs the picture
+    // without the HUD, and this used to clear the flag by never reaching the store.
+    if (vk_dlssg_active()) __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);
     if (!vk_ngxfg_wanted()) return 0;   // the Windows build, or a run that started without DLSS upscaling
     int want = vk_ngxfg_on() && !g_sc_hdr && !vk_fg_active() && !vk_dlssg_active();
-    if (!vk_fg_wanted()) vk_dlaa_hudless_wanted = want;   // the HUD-less picture DLSS-G tells the HUD apart by
+    if (!vk_fg_wanted())
+        __atomic_store_n(&vk_dlaa_hudless_wanted, want || vk_dlssg_active(), __ATOMIC_RELAXED);
     if (!want) {   // off (the menu switched it off live): what the presenter holds goes out first
         if (ng.on) ng_drain(), ng.on = 0, rt_log("ngxfg: frame generation off");
         return 0;
@@ -1541,7 +1546,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
     if (src) output_rate();
-    if (src) vk_dlssg_frame(cb, g_sc_ext);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
+    if (src) vk_dlssg_frame(cb, g_sc_ext, hudless, hudless ? g_hl_view : VK_NULL_HANDLE, g_sc_fmt);   // constants and tags
     // through the presenter: the picture stays in ng.bb, and DLSS Frame Generation's frames and the copy for the
     // presenter are recorded; otherwise the swapchain image is ready to present
     int ng_set = 0;

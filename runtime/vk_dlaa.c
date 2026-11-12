@@ -1828,7 +1828,8 @@ evaluated:
     vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
     full_barrier(cb);
     if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
-    if (vk_dlaa_hudless_wanted) hudless(cb, e, ow, oh);   // frame generation keeps the HUD out of its generated frames
+    if (__atomic_load_n(&vk_dlaa_hudless_wanted, __ATOMIC_RELAXED))
+        hudless(cb, e, ow, oh);   // frame generation keeps the HUD out of its generated frames
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image;
@@ -1856,8 +1857,10 @@ evaluated:
 // The HUD-less picture (vk_dlaa_fg_hudless): DLSS's output, which the HUD is then drawn over, through the encode the
 // game's last pass gives its picture (linear to sRGB), as RGBA8 UNORM bytes like the picture the present reads. With
 // HDR (NX2NAVI_HDR = 1) the game's picture stays float and linear up to the present, which encodes it to PQ
-// (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes inside the
-// game, which this cannot follow: no HUD-less picture there.
+// (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes its PQ
+// picture inside the game, after the HUD has been drawn on this linear target. Repeating that encode is not possible
+// here, and a linear copy would not match the swapchain, so no HUD-less picture is made. Generation still runs in
+// that mode, without the tag (vk_dlssg.c): the HUD is interpolated. SDR and hdr = 1 keep the picture.
 int vk_dlaa_hudless_wanted;
 static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();
@@ -1876,7 +1879,7 @@ static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) 
             if (v2) vkDestroyImageView(c->device, v2, NULL);   // the first image's view, when the second image failed
             hl_destroy();   // and what of the two images was made
             rt_log("dlaa: the HUD-less picture's images could not be made: frame generation sees the HUD");
-            vk_dlaa_hudless_wanted = 0;
+            __atomic_store_n(&vk_dlaa_hudless_wanted, 0, __ATOMIC_RELAXED);
             return;
         }
         if (v2) vkDestroyImageView(c->device, v2, NULL);
