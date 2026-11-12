@@ -160,9 +160,10 @@ typedef struct {
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.
     void (*present)(const tex_t *t, const int crop[4], uint64_t at_ns);
-    // The game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture), after the image's own waits (the pacer's hold
-    // and the GPU's): the back end may hold it longer (vk_dlssg.c vk_dlssg_frame_start, Reflex's sleep for DLSS Frame
-    // Generation). NULL: nothing to do.
+    // The game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture). The back end may hold it here
+    // (vk_dlssg.c vk_dlssg_frame_start, Reflex's sleep for DLSS Frame Generation). While Reflex holds the limit,
+    // that sleep is before the image's GPU wait, so the wait is part of the frame Reflex times. Otherwise it is
+    // after the pacer's hold and the GPU's. NULL: nothing to do.
     void (*frame_start)(void);
     void (*finish)(void);
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
