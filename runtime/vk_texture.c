@@ -4064,6 +4064,7 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 
 void vk_texture_new_submit(void) {
     lock();
+    vk_mem_budget_tick((submit_epoch & 7) == 0);   // before this submission allocates: the budget gate's sample
     // the last one walked the pool, or checked its entries by list
     if (pool_by_list || (round_checks && (uint64_t)round_checks * 2 >= pool_slots)) look_round++;
     round_checks = 0, pool_by_list = 0;

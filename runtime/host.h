@@ -108,6 +108,7 @@ typedef struct {
     int have_gpu, have_vram, vram_exact;
     uint64_t gpu_ns, gpu_parts, gpu_missed;     // busy time, submission parts timed, parts left untimed
     uint64_t vram_used, vram_budget;
+    uint64_t vram_line, vram_free, vram_outside, vram_refused;   // budget gate (0 line: off or not sampled yet)
     int have_idle;                              // calibrated timestamps: the idle split below is filled
     uint64_t idle_ns, starved_ns, queued_ns;    // GPU idle between timed parts; of it, before the part was submitted; submit to start
     uint64_t idle_gaps, max_gap_ns;             // gaps over 0.5 ms; the longest

@@ -139,7 +139,13 @@ static void top_up(const VkCtx *c, uint32_t type) {
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_UNKNOWN};
     VmaAllocation a;
     int64_t before = H.made;
-    if (vmaAllocateMemory(c->vma, &req, &ai, &a, NULL) != VK_SUCCESS) return;
+    // The budget gate fails this with OUT_OF_DEVICE_MEMORY when a new block would enter the last slice of the
+    // budget. The spare already held is usage; let it go, and the next check allocates it again once there is room.
+    VkResult ar = vmaAllocateMemory(c->vma, &req, &ai, &a, NULL);
+    if (ar != VK_SUCCESS) {
+        if (ar == VK_ERROR_OUT_OF_DEVICE_MEMORY) drop_anchor(c, type);
+        return;
+    }
     if (H.made == before) {   // there was room
         vmaFreeMemory(c->vma, a);
         return;
