@@ -384,6 +384,12 @@ void vk_mem_stage_log(const char *stage);         // one line after a boot stage
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
+// The device-local budget gate (vram_budget.h). Tick samples heapUsage; alloc_ok is what vkAllocateMemory asks,
+// and it only reads the sample. Sample copies the latest figures out for the perf line (zeros until the first tick).
+void vk_mem_budget_tick(int force);
+int vk_mem_device_alloc_ok(uint32_t memory_type, uint64_t bytes);
+void vk_mem_budget_sample(uint64_t *used, uint64_t *budget, uint64_t *line, uint64_t *free_inside, uint64_t *outside,
+                          uint64_t *refused);
 // VRAM headroom (vk_headroom.c): the VMA callbacks that see new device memory, and the thread that allocates the next
 // block of each memory type in use ahead of the render thread.
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);

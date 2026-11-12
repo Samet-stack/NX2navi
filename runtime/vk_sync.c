@@ -497,6 +497,7 @@ static void gpu_stats(PerfGpu *g) {
     g->gpu_parts = (uint64_t)plat_xchg64(&ts_parts, 0);
     g->gpu_missed = (uint64_t)plat_xchg64(&ts_missed, 0);
     g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);
+    vk_mem_budget_sample(NULL, NULL, &g->vram_line, &g->vram_free, &g->vram_outside, &g->vram_refused);
     g->have_idle = vk_ctx()->has_calibrated != 0 && cal_at != 0;
     g->idle_ns = (uint64_t)plat_xchg64(&ts_idle_ns, 0);
     g->starved_ns = (uint64_t)plat_xchg64(&ts_starved_ns, 0);

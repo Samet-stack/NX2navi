@@ -441,6 +441,10 @@ A change to where the lazy write-back is on by default (`runtime/wb_lazy_choice.
 `vk_mem_lazy_decide`) passes `python tests\wb_lazy_check.py`, which builds the header alone and checks the choice and
 its reason by platform, by GPU driver and by what the player set. No game files, no GPU.
 
+A change to the device-local budget gate (`runtime/vram_budget.h`, `runtime/vk_memory.c` `vk_mem_device_alloc_ok`,
+`runtime/vk_vma.cpp`) passes `python tests\vram_budget_check.py`, which builds the header alone and checks the margin,
+a burst of blocks against one sample, and the recorded session that crossed its budget. No game files, no GPU.
+
 A change to what writes `nx2navi.ini` outside the game (`launcher/gameini.py`, `installer/ini.py`, `tools/make_game.py`,
 `launcher/updater.py`) passes the settings-file tests of `tests\launcher_test.py` (`PlayerIniTest`, and the tests named
 `..._settings_file` of `BackgroundUpdateTest` and `MakeGameTest`): a player's file with lines that are no settings of

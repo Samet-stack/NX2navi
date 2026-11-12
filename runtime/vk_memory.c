@@ -18,6 +18,7 @@
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
 #include "vk.h"
+#include "vram_budget.h"
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_gpa.h"
@@ -752,6 +753,143 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     uint64_t cap = budget_cap();
     if (ok && cap && *budget > cap) *budget = cap;
     return ok;
+}
+
+// The allocation gate (vram_budget.h, vk_vma.cpp). Figures are published as atomics: vkAllocateMemory reads them
+// while VMA holds its lock, and a call back into VMA from there would deadlock. `granted` is the bytes this process
+// has been allowed to allocate since the last sample, so one submission's burst cannot walk past the line on a stale
+// sample. margin 0 (NX2NAVI_VRAM_MARGIN_MB=0, or no budget yet): the gate is off.
+static volatile uint64_t gate_used, gate_budget, gate_margin, gate_granted, gate_refused, gate_refused_bytes;
+static volatile uint64_t gate_free, gate_outside;
+static volatile uint32_t gate_local;   // bit i: memory type i is device-local
+static volatile int gate_ready;
+static uint64_t gate_logged_bytes;
+static int gate_logs;
+
+static uint64_t margin_of(uint64_t budget) {
+    static int mode = -3;   // -3 unread, -2 off, -1 auto, else the player's MiB
+    if (mode == -3) {
+        const char *s = cfg_value("NX2NAVI_VRAM_MARGIN_MB");
+        if (!s || !*s) mode = -1;
+        else {
+            long v = strtol(s, NULL, 10);
+            mode = v > 0 ? (int)v : -2;
+        }
+        if (mode == -2) rt_log("vk: new device-local blocks are not held short of the budget (NX2NAVI_VRAM_MARGIN_MB=0)");
+    }
+    if (mode == -2 || !budget) return 0;
+    if (mode > 0) {
+        uint64_t m = (uint64_t)mode << 20;
+        return m > budget / 4 ? budget / 4 : m;
+    }
+    return vram_margin_auto(budget);
+}
+
+static void device_local_mask(void) {
+    VkCtx *c = vk_ctx();
+    if (!c || gate_local) return;
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < c->mem_props.memoryTypeCount && i < 32; i++)
+        if (c->mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) m |= 1u << i;
+    __atomic_store_n(&gate_local, m, __ATOMIC_RELEASE);
+}
+
+// Every eight submits, and every submit once usage is within 1.5 GiB of the budget: the sample the gate reads.
+void vk_mem_budget_tick(int force) {
+    // The common case is a sample every eight submits. Near the budget, every submit: a burst of new blocks has to
+    // see the one before it. The sample is a driver call, so it is not taken on the submits in between.
+    if (!force && __atomic_load_n(&gate_ready, __ATOMIC_RELAXED)) {
+        uint64_t u = __atomic_load_n(&gate_used, __ATOMIC_RELAXED);
+        uint64_t b = __atomic_load_n(&gate_budget, __ATOMIC_RELAXED);
+        uint64_t m = __atomic_load_n(&gate_margin, __ATOMIC_RELAXED);
+        if (!(m && b && u + (1536ull << 20) >= b)) return;
+    }
+    // One heap query: with the budget extension VMA's figures are the driver's, and the block statistics come along.
+    VkCtx *c = vk_ctx();
+    uint64_t used = 0, budget = 0, blocks = 0, allocs = 0;
+    int have = 0;
+    if (c && c->vma) {
+        VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(c->vma, vb);
+        const VkPhysicalDeviceMemoryProperties *mp = &c->mem_props;
+        for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+            if (!(mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+            if (c->has_memory_budget) used += vb[h].usage, budget += vb[h].budget;
+            else used += vb[h].statistics.blockBytes, budget += mp->memoryHeaps[h].size;
+            blocks += vb[h].statistics.blockBytes, allocs += vb[h].statistics.allocationBytes;
+            have = 1;
+        }
+        uint64_t cap = budget_cap();
+        if (cap && budget > cap) budget = cap;
+    }
+    if (!have) {
+        int exact = 0;
+        if (!vk_mem_vram(&used, &budget, &exact)) return;
+    }
+    if (!budget) return;
+    device_local_mask();
+    uint64_t margin = margin_of(budget);
+    uint64_t free_in = blocks > allocs ? blocks - allocs : 0;
+    uint64_t outside = used > blocks ? used - blocks : 0;
+    __atomic_store_n(&gate_used, used, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_budget, budget, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_margin, margin, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_granted, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_free, free_in, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_outside, outside, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_ready, 1, __ATOMIC_RELEASE);
+    static int told;
+    if (!told && margin) {
+        told = 1;
+        rt_log("vk: a new device-local block stays %.0f MiB under the budget (NX2NAVI_VRAM_MARGIN_MB; 0 turns this off). "
+               "Free space inside a block and a destroyed image do not lower what the budget counts",
+               (double)(margin >> 20));
+    }
+    uint64_t refused_b = __atomic_load_n(&gate_refused_bytes, __ATOMIC_RELAXED);
+    if (refused_b != gate_logged_bytes && gate_logs < 12) {
+        gate_logs++;
+        uint64_t n = __atomic_load_n(&gate_refused, __ATOMIC_RELAXED);
+        rt_log("vk: refused a new device-local block (%llu so far, %.0f MiB): %.0f of %.0f MiB in use, the line is %.0f; "
+               "%.0f MiB free inside existing blocks, %.0f MiB outside them",
+               (unsigned long long)n, refused_b / 1048576.0, used / 1048576.0, budget / 1048576.0,
+               vram_budget_line(budget, margin) / 1048576.0, free_in / 1048576.0, outside / 1048576.0);
+        gate_logged_bytes = refused_b;
+    }
+}
+
+int vk_mem_device_alloc_ok(uint32_t type, uint64_t bytes) {
+    if (!__atomic_load_n(&gate_ready, __ATOMIC_ACQUIRE) || !bytes) return 1;
+    uint32_t local = __atomic_load_n(&gate_local, __ATOMIC_RELAXED);
+    if (!local || type >= 32 || !(local & (1u << type))) return 1;
+    uint64_t margin = __atomic_load_n(&gate_margin, __ATOMIC_RELAXED);
+    uint64_t budget = __atomic_load_n(&gate_budget, __ATOMIC_RELAXED);
+    if (!margin || !budget) return 1;
+    uint64_t used = __atomic_load_n(&gate_used, __ATOMIC_RELAXED);
+    // Charge the block before the driver reports it, so the rest of this submission sees it. A sample that lands
+    // in the middle of the exchange retries; one that wins the race and then has its charge cleared is one block.
+    uint64_t prev = __atomic_load_n(&gate_granted, __ATOMIC_RELAXED);
+    for (int n = 0; n < 8; n++) {
+        if (!vram_allow_block(used + prev, budget, bytes, margin)) {
+            __atomic_fetch_add(&gate_refused, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&gate_refused_bytes, bytes, __ATOMIC_RELAXED);
+            return 0;
+        }
+        if (__atomic_compare_exchange_n(&gate_granted, &prev, prev + bytes, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    return 1;
+}
+
+void vk_mem_budget_sample(uint64_t *used, uint64_t *budget, uint64_t *line, uint64_t *free_inside, uint64_t *outside,
+                          uint64_t *refused) {
+    if (used) *used = __atomic_load_n(&gate_used, __ATOMIC_RELAXED);
+    if (budget) *budget = __atomic_load_n(&gate_budget, __ATOMIC_RELAXED);
+    uint64_t b = budget ? *budget : __atomic_load_n(&gate_budget, __ATOMIC_RELAXED);
+    uint64_t m = __atomic_load_n(&gate_margin, __ATOMIC_RELAXED);
+    if (line) *line = vram_budget_line(b, m);
+    if (free_inside) *free_inside = __atomic_load_n(&gate_free, __ATOMIC_RELAXED);
+    if (outside) *outside = __atomic_load_n(&gate_outside, __ATOMIC_RELAXED);
+    if (refused) *refused = __atomic_load_n(&gate_refused, __ATOMIC_RELAXED);
 }
 
 // vk_mem_vram's use less the free space inside VMA's device-local blocks: the driver counts a block whole for as long
@@ -3734,12 +3872,15 @@ static void vram_use_log(VkCtx *c, uint64_t frame, const VmaBudget *vb, const Vk
     char ds[48] = "n/a";
     if (dlss >= 0) snprintf(ds, sizeof ds, "%.0f MiB", dlss / 1048576.0);
     const double M = 1048576.0;
+    uint64_t line = 0, refused = 0;
+    vk_mem_budget_sample(NULL, NULL, &line, NULL, NULL, &refused);
     rt_log("mem: vram by use frame %llu: in use %.0f MiB = VMA blocks %.0f MiB (textures %.0f, released textures %.0f, "
            "VRAM mirrors %.0f, physical pools %.0f, ASTC scratch %.0f, headroom spare %.0f, other %.0f, free inside the "
-           "blocks %.0f) + outside VMA %.0f MiB (swapchain, DLSS and frame generation, pipelines, driver; DLSS reports %s)",
+           "blocks %.0f) + outside VMA %.0f MiB (swapchain, DLSS and frame generation, pipelines, driver; DLSS reports %s); "
+           "budget line %.0f MiB, new device blocks refused %llu so far",
            (unsigned long long)frame, usage / M, blocks / M, t->bytes_live / M, t->bytes_released / M, mir / M, phys / M,
            scratch / M, held / M, allocs > known ? (allocs - known) / M : 0.0, blocks > allocs ? (blocks - allocs) / M : 0.0,
-           usage > blocks ? (usage - blocks) / M : 0.0, ds);
+           usage > blocks ? (usage - blocks) / M : 0.0, ds, line / M, (unsigned long long)refused);
 }
 
 // With NX2NAVI_TRACE=perf every 60 frames: a line when the device-local memory VMA did not allocate (vram_use_log's
