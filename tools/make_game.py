@@ -1388,6 +1388,8 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), op
         extra = []
         if fast_on:
             extra.extend(fast_build.FAST_CFLAGS)
+            if opts.lto:
+                extra.extend(fast_build.LTO_CFLAGS)
         if pgo_on and opts.flags:
             extra.extend(opts.flags)
         if opts and opts.pgo == 'gen' and not guest:
@@ -2370,12 +2372,27 @@ def build_opts(a, out):
         digest = sha256_file(path)
         flags = fast_build.pgo_use_flags(path.resolve().as_posix())
         salt = digest
+    lto = bool(a.fast) and fast_build.lto_ok(lld_dir(Path(a.msys), toolchain))
     if a.fast:
         link.extend(fast_build.FAST_LDFLAGS)
+        if lto:
+            link.extend(fast_build.LTO_LDFLAGS)
     text = fast_build.describe(bool(a.fast), chosen or "the processor's x86-64 level, on the lifted code and the runtime",
-                               pgo)
+                               pgo, lto)
     return fast_build.Opts(bool(a.fast), march_name, chosen, pgo, flags, tuple(link), toolchain,
-                           fast_build.profile_tag(bool(a.fast), march_name, pgo, digest), salt, text)
+                           fast_build.profile_tag(bool(a.fast), march_name, pgo, digest, lto), salt, text, lto)
+
+
+def lld_dir(msys, toolchain=None):
+    """The bin directory whose ld.lld the game's link would use, for fast_build.lto_ok: llvm-mingw's with --toolchain
+    (its clang links with lld), MSYS2's on Windows (the link adds -fuse-ld=lld only when ld.lld.exe is there), the
+    one on PATH elsewhere. None when there is none."""
+    if toolchain:
+        return Path(toolchain) / 'bin'
+    if WIN:
+        return msys / 'bin'
+    found = shutil.which('ld.lld')
+    return Path(found).parent if found else None
 
 
 def build_main():
@@ -2396,7 +2413,7 @@ def build_main():
     ap.add_argument('--jobs', type=int,
                     help='parallel compiles (default: one per processor, fewer when the free memory is short)')
     ap.add_argument('--fast', action='store_true',
-                    help='optional profile: -O3, thin LTO, -fno-plt, -fomit-frame-pointer, -DNDEBUG, and -march on '
+                    help='optional profile: -O3, thin LTO (when ld.lld is there), -fno-plt, -fomit-frame-pointer, -DNDEBUG, and -march on '
                          'the runtime as well as the lifted code. The default build is unchanged. See BUILD_FAST.md')
     ap.add_argument('--march', choices=tuple(fast_build.MARCHES),
                     help='with --fast: -march (znver4, v3, v4). Default: this processor\'s x86-64 level. '
@@ -2489,6 +2506,9 @@ def build_main():
             probe_cc = probe_cxx = probe_env = None
             if opts.fast:
                 extra_c += ['-O3', '-fno-plt']
+                if opts.lto:   # only when ld.lld is there (fast_build.lto_ok): GNU ld cannot link thin LTO objects
+                    extra_c += list(fast_build.LTO_CFLAGS)
+                    extra_ld += list(fast_build.LTO_LDFLAGS)
             if opts.pgo == 'gen':
                 extra_c += ['-fprofile-generate']
                 extra_ld += ['-fprofile-generate']

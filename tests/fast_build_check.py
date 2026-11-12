@@ -112,6 +112,31 @@ class Flags(unittest.TestCase):
                          'fast+znver4+pgo-0123456789abcdef')
 
 
+class ThinLto(unittest.TestCase):
+    def test_lto_only_where_ld_lld_is(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(fast_build.lto_ok(tmp))   # the launcher's UCRT64 bin: no ld.lld
+            (Path(tmp) / 'ld.lld.exe').write_bytes(b'')
+            self.assertTrue(fast_build.lto_ok(tmp))    # llvm-mingw's bin
+        self.assertFalse(fast_build.lto_ok(None))
+        self.assertNotIn('-flto=thin', fast_build.FAST_CFLAGS + fast_build.FAST_LDFLAGS)
+
+    def test_fast_adds_thin_lto_only_when_asked(self):
+        plain = fast_build.Opts(True, 'znver4', '-march=znver4', None, (), (), None, 'fast+znver4', '', '')
+        lto = fast_build.Opts(True, 'znver4', '-march=znver4', None, (), ('-flto=thin',), None, 'fast+znver4+lto', '',
+                              '', lto=True)
+        for guest in (True, False):
+            self.assertNotIn('-flto=thin', cmd(guest, opts=plain))
+            self.assertIn('-O3', cmd(guest, opts=plain))
+            self.assertIn('-flto=thin', cmd(guest, opts=lto))
+        # a fast build without LTO keeps the tag it had, so the objects it compiled stay current
+        self.assertEqual(fast_build.profile_tag(True, 'znver4', None), 'fast+znver4')
+        self.assertEqual(fast_build.profile_tag(True, 'znver4', None, lto=True), 'fast+znver4+lto')
+        self.assertIn('no thin LTO', fast_build.describe(True, '-march=znver4', None))
+        self.assertIn('-flto=thin', fast_build.describe(True, '-march=znver4', None, True))
+
+
 class BuildGameFlags(unittest.TestCase):
     def test_set_fast_and_pgo_keep_o3(self):
         import build_game

@@ -8,14 +8,20 @@ FAST_OPT = '-O3'
 # -fomit-frame-pointer is already what clang does at -O1 and above on x86-64. It is named here so the profile says so.
 # -DNDEBUG compiles out assert(). The runtime's own checks are rt_fatal and stay; perf traces stay too.
 # -flto=thin needs lld: GNU ld cannot load LLVMgold.dll from the launcher's MSYS2 UCRT64 toolchain (no ld.lld there),
-# so the probe link fails. LTO is only added when ld.lld is next to clang (lto_ok).
+# so the probe link fails. Thin LTO is added to the fast profile only when ld.lld is next to the clang that compiles
+# and links (lto_ok): llvm-mingw has it, the launcher's UCRT64 tree does not, so that one keeps -O3 without LTO.
 FAST_CFLAGS = ('-fomit-frame-pointer', '-fno-plt', '-DNDEBUG')
 FAST_LDFLAGS = ()
 LTO_FLAG = '-flto=thin'
+LTO_CFLAGS = (LTO_FLAG,)
+LTO_LDFLAGS = (LTO_FLAG,)
 
 
 def lto_ok(bindir):
+    """True when bindir (a toolchain's bin directory) holds ld.lld, the linker thin LTO needs. None or '' is False."""
     import os
+    if not bindir:
+        return False
     return os.path.isfile(os.path.join(str(bindir), 'ld.lld.exe')) or os.path.isfile(os.path.join(str(bindir), 'ld.lld'))
 
 # --march names. v3 and v4 are the x86-64 levels; znver4 also schedules for Zen 4.
@@ -32,8 +38,8 @@ AVX512 = frozenset({'znver4', 'v4', 'x86-64-v4'})
 class Opts:
     """What --fast and --pgo add. Absent (None) means the default build."""
 
-    def __init__(self, fast, march_name, march_flag, pgo, flags, link, toolchain, tag, salt, text):
-        self.fast = fast              # -O3, thin LTO, and a march on the runtime as well as the lifted code
+    def __init__(self, fast, march_name, march_flag, pgo, flags, link, toolchain, tag, salt, text, lto=False):
+        self.fast = fast              # -O3 and a march on the runtime as well as the lifted code
         self.march_name = march_name  # the --march name, or ''
         self.march_flag = march_flag  # '-march=...' or '' (then the fast profile uses the detected x86-64 level)
         self.pgo = pgo                # None, 'gen' or 'use'
@@ -43,6 +49,7 @@ class Opts:
         self.tag = tag                # compile step key suffix; '' would be the default and is never stored here
         self.salt = salt              # mixed into the object-cache key when the profile file's bytes matter
         self.text = text              # one line for the build log
+        self.lto = bool(lto)          # thin LTO on the compiles (fast only, and only when ld.lld is there: lto_ok)
 
 
 def march_flag(name):
@@ -113,13 +120,17 @@ def pgo_gen_flags(directory):
     )
 
 
-def profile_tag(fast, march_name, pgo_kind, pgo_digest=''):
-    """Suffix of the compile step key. '' for the default build, so a build that does not opt in keeps the key it had."""
+def profile_tag(fast, march_name, pgo_kind, pgo_digest='', lto=False):
+    """Suffix of the compile step key. '' for the default build, so a build that does not opt in keeps the key it had.
+    lto adds '+lto': thin LTO objects are bitcode, not the -O3 objects of the same profile without it. A fast build
+    without LTO keeps the tag it had ('fast+znver4'), so its objects stay current."""
     bits = []
     if fast:
         bits.append('fast')
         if march_name:
             bits.append(march_name)
+        if lto:
+            bits.append('lto')
     if pgo_kind == 'gen':
         bits.append('pgo-gen')
     elif pgo_kind == 'use':
@@ -127,10 +138,14 @@ def profile_tag(fast, march_name, pgo_kind, pgo_digest=''):
     return '+'.join(bits)
 
 
-def describe(fast, march_text, pgo_kind):
+def describe(fast, march_text, pgo_kind, lto=False):
     parts = []
     if fast:
-        parts.append('-O3 -fno-plt -fomit-frame-pointer -DNDEBUG, march ' + march_text)
+        if lto:
+            parts.append('-O3 -flto=thin -fno-plt -fomit-frame-pointer -DNDEBUG, march ' + march_text)
+        else:
+            parts.append('-O3 -fno-plt -fomit-frame-pointer -DNDEBUG (no thin LTO: no ld.lld next to clang), march '
+                         + march_text)
     if pgo_kind == 'gen':
         parts.append('instrumented (-fprofile-generate)')
     elif pgo_kind == 'use':

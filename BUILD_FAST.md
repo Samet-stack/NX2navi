@@ -61,7 +61,12 @@ Il ne s’applique que si tu passes `--fast`. Flags ajoutés ou remplacés, des 
 
 - `-O3` à la place de `-O1` / `-O2`
 - `-flto=thin` à la compilation et au lien (pas `-flto` complet : le code relevé est gros, le LTO complet n’est pas ce
-  profil)
+  profil), **seulement si `ld.lld` est à côté du clang qui lie** (`tools/fast_build.py` `lto_ok`). GNU ld ne lie pas
+  les objets LTO mince du clang UCRT64. Le toolchain du launcher n’a pas `ld.lld` : là, `--fast` reste à `-O3` sans
+  LTO, et le log le dit (`no thin LTO: no ld.lld next to clang`). llvm-mingw a `ld.lld` : `build_game.py --toolchain`
+  et `make_game.py --pgo gen --toolchain` ajoutent le LTO mince. Avec `make_game.py`, sans `--toolchain`, il faut
+  `ld.lld.exe` dans le `bin` MSYS2 (paquet `mingw-w64-ucrt-x86_64-lld`) ; le lien passe alors `-fuse-ld=lld`. La clé
+  de l’étape `compile` gagne `+lto` dans ce cas seulement : un build `fast+znver4` sans LTO garde sa clé.
 - `-fno-plt`
 - `-fomit-frame-pointer` (déjà le défaut de clang à `-O1` et au-dessus ; le flag le dit)
 - `-DNDEBUG` (coupe `assert()`, pas `rt_fatal`, pas les traces `trace=perf` / `replay_time`)
@@ -136,7 +141,9 @@ Si `--rebuild` refuse parce que l’exefs n’est pas dans le dossier de sortie 
 py -I tools\make_game.py --fast --march znver4 --exefs D:\Games\NX2navi\exefs --romfs D:\Games\NX2navi\romfs --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
 ```
 
-Dans le log de build tu dois voir une ligne `profile: -O3 -flto=thin ... march -march=znver4`. Tu ne dois pas voir
+Dans le log de build tu dois voir une ligne `profile: -O3 -flto=thin ... march -march=znver4` si `ld.lld` est là, ou
+`profile: -O3 -fno-plt -fomit-frame-pointer -DNDEBUG (no thin LTO: no ld.lld next to clang), march -march=znver4` avec
+le toolchain du launcher. Tu ne dois pas voir
 `the runtime comes prebuilt`.
 
 Même profil sur le build de développement (pas le chemin 1.1.1 ; il lui faut un `generated/<version>` et un fichier

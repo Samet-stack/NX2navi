@@ -114,9 +114,10 @@ def set_cpu(cpu):
     RT_FLAGS.append(f'-DRT_CPU_LEVEL={3 if cpu == "v3" else 2}')
 
 
-def set_fast(march=None):
+def set_fast(march=None, lto=True):
     """--fast, after set_cpu. march is a -march= flag, or None to keep the one set_cpu chose.
-    Both the lifted code and the runtime go to -O3 with thin LTO. The runtime's -g is left out: this is not a debug
+    Both the lifted code and the runtime go to -O3, with thin LTO when lto (this build always links with
+    -fuse-ld=lld, LINK_FLAGS; main passes fast_build.lto_ok of the toolchain's bin). The runtime's -g is left out: this is not a debug
     build. assert() is compiled out (-DNDEBUG); rt_fatal and the perf traces stay. Does nothing to the default build,
     which never calls this."""
     for flags in (GEN_FLAGS, RT_FLAGS):
@@ -137,10 +138,10 @@ def set_fast(march=None):
                     hit = True
             if not hit:
                 flags.append(march)
-        for flag in fast_build.FAST_CFLAGS:
+        for flag in fast_build.FAST_CFLAGS + (fast_build.LTO_CFLAGS if lto else ()):
             if flag not in flags:
                 flags.append(flag)
-    for flag in fast_build.FAST_LDFLAGS:
+    for flag in fast_build.FAST_LDFLAGS + (fast_build.LTO_LDFLAGS if lto else ()):
         if flag not in LINK_FLAGS:
             LINK_FLAGS.append(flag)
 
@@ -906,8 +907,16 @@ def main():
         sys.exit('--fast compiles the runtime from source. --runtime-lib would leave the replay in the generic library')
     set_cpu(args.cpu)
     if args.fast:
-        set_fast(fast_build.march_flag(args.march) if args.march else None)
-        print('build_game: fast profile (not the default): -O3 -flto=thin -fno-plt -fomit-frame-pointer -DNDEBUG, '
+        if args.toolchain:
+            lld_bin = args.toolchain / 'bin'
+        elif WIN:
+            lld_bin = UCRT
+        else:
+            lld_bin = Path(shutil.which('ld.lld')).parent if shutil.which('ld.lld') else None
+        lto = fast_build.lto_ok(lld_bin)
+        set_fast(fast_build.march_flag(args.march) if args.march else None, lto)
+        print('build_game: fast profile (not the default): -O3 ' + ('-flto=thin ' if lto else '(no thin LTO: no ld.lld) ')
+              + '-fno-plt -fomit-frame-pointer -DNDEBUG, '
               + (fast_build.march_flag(args.march) if args.march else f'-march=x86-64-{args.cpu}'))
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
