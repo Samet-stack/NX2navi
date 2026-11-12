@@ -83,6 +83,7 @@ from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT / 'tools'))
+import fast_build  # noqa: E402
 import nup  # noqa: E402
 import prompt_art  # noqa: E402
 
@@ -1081,7 +1082,7 @@ def runtime_headers(rt):
         build_shaders.build(rt, stale)
 
 
-def preflight(msys, jobs, sources=None):
+def preflight(msys, jobs, sources=None, opts=None):
     """Linux, before the long steps of a build whose compile step will run: this machine's compiler, headers and
     libraries are tried on the runtime itself. Every runtime source that needs no header of this install is checked
     with the compile step's own command (clang -fsyntax-only), and an empty program is linked against the libraries
@@ -1089,14 +1090,16 @@ def preflight(msys, jobs, sources=None):
     headers and VMA come with the kit), and a distribution's older compiler, older headers or a missing development
     package stopped the compile step only after the RomFS image and the lift, ten minutes and more into the build.
     sources: the files to check instead (tests)."""
-    clang, clangxx, env, vma = toolchain(msys)
+    # One argument when there is no llvm-mingw: tests replace toolchain with a function of that one argument.
+    clang, clangxx, env, vma = toolchain(msys, opts.toolchain) if opts and opts.toolchain else toolchain(msys)
     version = clang_version(clang, env)
     say(f'check: the compiler is {version}')
     rt = KIT / 'runtime'
     runtime_headers(rt)
     inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
     vulkan = vulkan_headers(clang, env)
-    cmd_for = runtime_cmd(clang, clangxx, inc, first=vulkan)
+    level = cpu_level(clang, env) if opts and opts.fast else 0
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, msys=msys, first=vulkan, opts=opts)
     if sources is None:
         tainted = per_install_names()
         sources = [p for p, _ in runtime_sources() if not per_install(p, tainted)]
@@ -1133,14 +1136,15 @@ def preflight(msys, jobs, sources=None):
     say(f'check: {len(sources)} runtime files and the libraries pass, {time.time() - t0:.0f} s')
 
 
-def steps_to_run(state, identity, out, until=None):
+def steps_to_run(state, identity, out, until=None, build_tag=''):
     """The steps from exefs to shaders this build will run, as main's loop decides it: a step whose key is not the
     recorded one, and every step after one that runs but those that read nothing of it (UNAFFECTED). until: the
-    step the build stops after (--until). For the checks made before the long steps (space_needs, probe_toolchain)."""
+    step the build stops after (--until). For the checks made before the long steps (space_needs, probe_toolchain).
+    build_tag: the compile step's profile suffix (--fast, --pgo); '' is the default build."""
     runs = []
     for name in STEPS[:STEPS.index('shaders') + 1]:
         if (any((earlier, name) not in UNAFFECTED for earlier in runs)
-                or state['steps'].get(name) != step_key(name, identity, out)):
+                or state['steps'].get(name) != step_key(name, identity, out, build_tag)):
             runs.append(name)
         if name == until:
             break
@@ -1211,13 +1215,15 @@ def check_space(out, needs):
          f'{(need - free) / 1e9:.1f} GB more on that disk, or build into a folder on another one')
 
 
-def probe_toolchain(msys, work):
+def probe_toolchain(msys, work, clang=None, clangxx=None, env=None, extra_c=(), extra_ld=()):
     """Windows, before the long steps of a build whose compile step will run: an empty program is compiled and
     linked with the installed toolchain, against the libraries the game links and with the linker the compile step
     uses, in the folder work. Build tools that are incomplete, or that security software keeps from starting or
     from writing an exe, stopped the build in its compile step, after the RomFS image and the lift, ten minutes and
-    more in; this takes a second. (Linux tries its compiler on the runtime's own sources: preflight.)"""
-    clang, clangxx, env, _ = toolchain(msys)
+    more in; this takes a second. (Linux tries its compiler on the runtime's own sources: preflight.)
+    extra_c, extra_ld: flags of --fast or --pgo gen, so a toolchain that rejects them stops here."""
+    if clang is None:
+        clang, clangxx, env, _ = toolchain(msys)
     repair = (f'If the launcher installed these tools, delete the folder {msys.parent} and try again: it unpacks '
               f'them anew. If you installed MSYS2 yourself, install the packages README-BuildKit.md lists')
     shutil.rmtree(work, ignore_errors=True)
@@ -1226,8 +1232,9 @@ def probe_toolchain(msys, work):
         src, obj, exe = work / 'probe.c', work / 'probe.o', work / ('probe.exe' if WIN else 'probe')
         src.write_text('int main(void) { return 0; }\n', encoding='ascii')
         ld = ['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []
-        steps = (('compile', clang, [str(clang), '-c', '-std=gnu11', '-O1', '-o', str(obj), str(src)]),
-                 ('link', clangxx, [str(clangxx), *ld, '-o', str(exe), str(obj), '-L', str(msys / 'lib'), *LINK_LIBS]))
+        steps = (('compile', clang, [str(clang), '-c', '-std=gnu11', '-O1', *extra_c, '-o', str(obj), str(src)]),
+                 ('link', clangxx, [str(clangxx), *ld, *extra_ld, '-o', str(exe), str(obj), '-L', str(msys / 'lib'),
+                                    *LINK_LIBS]))
         for what, tool, cmd in steps:
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace')
@@ -1241,9 +1248,12 @@ def probe_toolchain(msys, work):
                 fail(f'{tool} cannot compile a test program ({said}): the build tools are incomplete, or security '
                      f'software blocks them. {repair}')
             lacking = sorted(set(re.findall(r'unable to find library (-l\S+)', p.stderr)))
+            pgo = (' --pgo gen also needs the profile runtime (clang_rt.profile). MSYS2 UCRT64 clang has none; '
+                   'pass --toolchain with an llvm-mingw directory (BUILD_FAST.md).' if '-fprofile-generate' in extra_ld
+                   else '')
             fail('the build tools cannot link the game: '
                  + (f'{msys / "lib"} lacks {", ".join(lacking)}' if lacking else f'the linker says: {said}')
-                 + f'. {repair}')
+                 + f'. {repair}{pgo}')
     finally:
         shutil.rmtree(work, ignore_errors=True)
     say('check: the build tools compile and link a test program')
@@ -1350,10 +1360,12 @@ def fast_clang(msys, clang, env):
     return fast if mine and clang_ident(fast, env) == mine else None
 
 
-def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
+def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=(), opts=None):
     """fast: fast_clang's compiler for the lifted code, with msys as its sysroot. first: include flags that go
     ahead of inc for the runtime's sources only (vulkan_headers); the lifted code includes none of those headers,
-    and its command, which is part of its objects' keys, stays as it was."""
+    and its command, which is part of its objects' keys, stays as it was. opts: a fast_build.Opts from --fast or
+    --pgo, or None for the default build. The default leaves the runtime without -march, so one prebuilt library
+    serves every PC; --fast compiles the runtime for the same march, because the replay is runtime code."""
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
@@ -1361,12 +1373,32 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
         # (tools/build_game.py's flags). The lifted code is built for this PC's level (cpu_level); the runtime
         # stays generic, so the prebuilt one serves every PC (its vectors are 16 bytes, passed alike at every level).
         guest = dst.name.startswith(('main_', 'sdk_', 'subsdk0_'))
-        march = [f'-march=x86-64-v{level}'] if guest and level else []
-        cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
+        fast_on = bool(opts and opts.fast)
+        pgo_on = bool(opts and opts.pgo)
+        # fast_clang writes the same objects as UCRT64 clang for the same flags. Thin LTO and an instrumented build
+        # are linked by the compiler that produced the objects, so those profiles do not use fast_clang. The caller
+        # passes fast=None then; this still checks, so a caller that passes both does not mix the two compilers.
+        use_fast = guest and fast and not (opts and (opts.fast or opts.pgo == 'gen' or opts.toolchain))
+        if use_fast:
+            cc = [str(fast), f'--sysroot={msys}']
+        else:
+            cc = [str(clangxx if cpp else clang)]
+            if opts and opts.toolchain and msys:
+                cc.append(f'--sysroot={msys}')
+        extra = []
+        if fast_on:
+            extra.extend(fast_build.FAST_CFLAGS)
+        if pgo_on and opts.flags:
+            extra.extend(opts.flags)
+        if opts and opts.pgo == 'gen' and not guest:
+            extra.append('-DNX2NAVI_PGO_GEN')
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
-                *march, '-fno-strict-aliasing', '-w', *declspec, *([] if guest else first), *inc, '-o', str(dst), str(src)]
+        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11',
+                fast_build.opt_flag(guest, fast_on, pgo_on),
+                *fast_build.march_args(guest, level, fast_on, opts.march_flag if opts else ''),
+                '-fno-strict-aliasing', '-w', *extra, *declspec, *([] if guest else first), *inc,
+                '-o', str(dst), str(src)]
     return cmd_for
 
 
@@ -1515,13 +1547,19 @@ def compile_resources(msys, rt, obj, env, lld=False):
     return rco
 
 
-def toolchain(msys):
+def toolchain(msys, llvm=None):
     """(clang, clang++, environment, the folder holding vk_mem_alloc.h): MSYS2 UCRT64's on Windows, the ones on PATH
     elsewhere. VMA_INCLUDE overrides tools/build_game.py's VMA lookup (the system's header, else the pinned one
-    fetched into toolchain/vma)."""
+    fetched into toolchain/vma). llvm: a directory with bin/clang (an llvm-mingw tree, --pgo gen). Its bin goes first
+    on PATH; the caller still passes --sysroot so the headers and libraries stay MSYS2's."""
     if WIN:
-        return (msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe',
-                dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', '')), msys / 'include' / 'vma')
+        env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+        vma = msys / 'include' / 'vma'
+        if llvm:
+            env['PATH'] = str(Path(llvm) / 'bin') + os.pathsep + env['PATH']
+            bin_dir = Path(llvm) / 'bin'
+            return bin_dir / 'clang.exe', bin_dir / 'clang++.exe', env, vma
+        return msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe', env, vma
     for tool in ('clang', 'clang++', 'ld.lld'):
         if not shutil.which(tool):
             fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')
@@ -1532,7 +1570,12 @@ def toolchain(msys):
     else:
         from build_game import vma_include
         vma = vma_include()
-    return Path(shutil.which('clang')), Path(shutil.which('clang++')), dict(os.environ), vma
+    env = dict(os.environ)
+    clang, clangxx = Path(shutil.which('clang')), Path(shutil.which('clang++'))
+    if llvm:
+        env['PATH'] = str(Path(llvm) / 'bin') + os.pathsep + env.get('PATH', '')
+        clang, clangxx = Path(llvm) / 'bin' / 'clang', Path(llvm) / 'bin' / 'clang++'
+    return clang, clangxx, env, vma
 
 
 def vulkan_headers(clang, env):
@@ -1597,20 +1640,26 @@ def retune_due(obj, msys):
         return True
 
 
-def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
+def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False, opts=None):
     """romfs_job: the RomFS step still running beside this one (a first build). Everything that does not include
     romfs_config.h compiles meanwhile; the RomFS index and the few files that include it follow once it is done.
-    update: a rebuild after a kit update (lifted_level)."""
+    update: a rebuild after a kit update (lifted_level). opts: --fast or --pgo (fast_build.Opts), or None."""
     lift, gen, obj = cache_dir / 'lift', cache_dir / 'gen', cache_dir / 'obj'
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
     runtime_headers(rt)
-    clang, clangxx, env, vma = toolchain(msys)
+    # One argument when there is no llvm-mingw: tests replace toolchain with a function of that one argument.
+    clang, clangxx, env, vma = toolchain(msys, opts.toolchain) if opts and opts.toolchain else toolchain(msys)
     if not romfs_job:
         romfs_index(out, gen)
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
-    prebuilt = prebuilt_runtime(clang, env)
+    # A prebuilt runtime is the generic -O2 library. --fast and --pgo compile runtime/ themselves: the replay is there.
+    if opts:
+        prebuilt = None
+        say('  the runtime is compiled with this profile, not taken from a prebuilt library')
+    else:
+        prebuilt = prebuilt_runtime(clang, env)
     runtime = [(p, obj / name) for p, name in runtime_sources()]
     if prebuilt:
         runtime = [(p, o) for p, o in runtime if o.name not in prebuilt[1]]
@@ -1629,13 +1678,21 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     else:
         say(f'  the lifted code is built for {f"x86-64-v{level}" if level else "generic x86-64"}, as the objects kept '
             f'from before this update were (Rebuild the Game compiles it for this processor\'s level)')
-    fast = fast_clang(msys, clang, env)
+    if opts:
+        say(f'  profile: {opts.text}')
+        if opts.fast and not opts.march_flag and not level:
+            say('  the processor\'s level could not be read, so the fast profile adds no -march')
+        if opts.pgo == 'gen':
+            (cache_dir / 'pgo').mkdir(parents=True, exist_ok=True)
+    # Thin LTO and the instrumented build are linked by the compiler that produced the objects. fast_clang is a second
+    # clang, used only for the default lifted code, where it writes the same objects.
+    fast = None if opts and (opts.fast or opts.pgo == 'gen' or opts.toolchain) else fast_clang(msys, clang, env)
     if fast:
         say(f'  the lifted code compiles with {fast}')
     vulkan = vulkan_headers(clang, env)
     if vulkan:
         say(f'  the Vulkan headers come from {vulkan[1]}')
-    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan)
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, first=vulkan, opts=opts)
     # The keys earlier versions gave the same compiles (compile_all alts): 0.6.0's, with the compiler's file time and,
     # with the fast compiler, its id and --sysroot; 0.5.0's and earlier's, with their kit's folder in the paths; and
     # up to 0.7.1 the runtime's without the Vulkan headers' folder ahead of the system's (an object that compiled
@@ -1666,6 +1723,10 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
             say(f'  compiled {done} of {total}, {now - t0:.0f} s')
 
     say(f'  {len(srcs)} files on {jobs} threads')
+    # An opted-in profile must not adopt objects from the default -O1/-O2 commands: those keys are the same sources
+    # compiled differently, and taking them would ship the default exe under the fast name.
+    use_alts = None if opts else alts
+    salt = cid + (opts.salt if opts else '')
     cache = ObjectCache(obj / 'objects.json', {'<kit>': KIT})
     late = []
     if romfs_job:   # the lifted chunks include only cpu.h and simd.h: only the runtime and generated files are read
@@ -1674,7 +1735,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         say(f'  {len(late)} files wait for the RomFS index: {", ".join(s.name for s, _ in late)}')
     early = [j for j in srcs if j not in late]
     compiled, reused, bad = compile_all(early, cmd_for, cache, jobs, env, lambda d, t: progress(d, len(srcs)),
-                                        salt=cid, stop=romfs_job.failed if romfs_job else None, alts=alts)
+                                        salt=salt, stop=romfs_job.failed if romfs_job else None, alts=use_alts)
     if romfs_job:
         if romfs_job.thread.is_alive():
             say('  waiting for the RomFS image')
@@ -1682,7 +1743,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         if not bad:
             romfs_index(out, gen)
             c2, r2, bad = compile_all(late, cmd_for, cache, jobs, env,
-                                      lambda d, t: progress(len(early) + d, len(srcs)), salt=cid, alts=alts)
+                                      lambda d, t: progress(len(early) + d, len(srcs)), salt=salt, alts=use_alts)
             compiled, reused = compiled + c2, reused + r2
     say(f'  {compiled} compiled, {reused} unchanged since the last build')
     if bad:
@@ -1706,6 +1767,10 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one.
     # -Xlinker passes the path as one argument; -Wl, would cut it at every comma of the game folder's path (issue #470)
     ld += ['-Xlinker', '--Map=' + (cache_dir / 'ocarina.map').as_posix()]
+    if opts and opts.toolchain:
+        ld.insert(0, f'--sysroot={msys}')
+    if opts:
+        ld.extend(opts.link)
     lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
     if prebuilt:
@@ -2207,11 +2272,13 @@ def step_scan(out):
              'retry this step')
 
 
-def step_key(step, identity, out=None):
+def step_key(step, identity, out=None, build_tag=''):
     """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS and the
     lifter; compile: the lift, the runtime sources, this script and the processor (cpu_tag); prompts: the game files,
     the kit's button art, the version of the tools that draw it (PROMPT_TOOLS), the bind_ lines of nx2navi.ini, and
-    whether every folder it writes is still there; scan: the game files, the check's version (SCAN_TOOL) and whether its report is still there."""
+    whether every folder it writes is still there; scan: the game files, the check's version (SCAN_TOOL) and whether its report is still there.
+    build_tag: '' for the default build, so its key stays what it was. --fast and --pgo set one, and a finished
+    default compile is then not reused for them."""
     if step in ('exefs', 'romfs'):
         return f'{step}-1|{identity}'
     if step == 'scan':
@@ -2228,6 +2295,8 @@ def step_key(step, identity, out=None):
         return lift
     compile_key = (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
                    f'|cpu {cpu_tag()}')
+    if build_tag:
+        compile_key += '|' + build_tag
     if step == 'compile':
         return compile_key
     # shaders: the built game and the translator that prepared them, the one xlate_source finds (the kit's bin/, or a
@@ -2257,6 +2326,58 @@ def main():
         fail(f'the build stopped: {error_text(e)}')
 
 
+def build_opts(a, out):
+    """None for the default build. Otherwise the flags --fast and --pgo add. Stops before any long step."""
+    if not a.fast and not a.pgo and not a.march and not a.toolchain:
+        return None
+    if a.march and not a.fast:
+        fail('--march is part of --fast. The default build keeps its own -march.')
+    if a.toolchain and a.pgo != 'gen':
+        fail('--toolchain is only for --pgo gen. A --fast build uses the MSYS2 clang.')
+    if a.pgo == 'gen' and WIN and not a.toolchain:
+        fail('--pgo gen: MSYS2 UCRT64 clang ships no profile runtime (clang_rt.profile). '
+             'Download llvm-mingw 20261020 and pass --toolchain DIR. BUILD_FAST.md has the commands. '
+             '--fast without --pgo does not need it.')
+    march_name = a.march or ''
+    try:
+        chosen = fast_build.march_flag(march_name)
+    except ValueError:
+        fail('--march %s is not one of: %s' % (march_name, ', '.join(sorted(fast_build.MARCHES))))
+    here = cpu_tag()
+    if march_name and not fast_build.march_runs_here(march_name, here):
+        fail(f'--march {march_name} needs AVX-512 and this processor does not have it (cpu tag {here}). '
+             'The exe would not run here.')
+    toolchain = Path(a.toolchain) if a.toolchain else None
+    if toolchain and not (toolchain / 'bin' / ('clang.exe' if WIN else 'clang')).is_file():
+        exe = 'clang.exe' if WIN else 'clang'
+        fail(f'{toolchain / "bin" / exe} is missing: --toolchain is the llvm-mingw directory, '
+             'the one that contains bin/clang.exe')
+    pgo = None
+    flags = ()
+    link = []
+    salt = ''
+    digest = ''
+    if a.pgo == 'gen':
+        pgo = 'gen'
+        directory = (out / 'build-cache' / 'pgo').resolve().as_posix()
+        flags = fast_build.pgo_gen_flags(directory)
+        link.append('-fprofile-generate')
+    elif a.pgo:
+        path = Path(a.pgo)
+        if not path.is_file():
+            fail(f'--pgo {a.pgo}: no such profile. Merge one with tools/pgo.py (BUILD_FAST.md).')
+        pgo = 'use'
+        digest = sha256_file(path)
+        flags = fast_build.pgo_use_flags(path.resolve().as_posix())
+        salt = digest
+    if a.fast:
+        link.extend(fast_build.FAST_LDFLAGS)
+    text = fast_build.describe(bool(a.fast), chosen or "the processor's x86-64 level, on the lifted code and the runtime",
+                               pgo)
+    return fast_build.Opts(bool(a.fast), march_name, chosen, pgo, flags, tuple(link), toolchain,
+                           fast_build.profile_tag(bool(a.fast), march_name, pgo, digest), salt, text)
+
+
 def build_main():
     global EVENTS
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -2274,6 +2395,18 @@ def build_main():
                     help='MSYS2 UCRT64 folder (default C:\\msys64\\ucrt64; Windows only: Linux takes clang and lld from PATH)')
     ap.add_argument('--jobs', type=int,
                     help='parallel compiles (default: one per processor, fewer when the free memory is short)')
+    ap.add_argument('--fast', action='store_true',
+                    help='optional profile: -O3, thin LTO, -fno-plt, -fomit-frame-pointer, -DNDEBUG, and -march on '
+                         'the runtime as well as the lifted code. The default build is unchanged. See BUILD_FAST.md')
+    ap.add_argument('--march', choices=tuple(fast_build.MARCHES),
+                    help='with --fast: -march (znver4, v3, v4). Default: this processor\'s x86-64 level. '
+                         'znver4 and v4 need AVX-512; the exe then runs only on a CPU that has it')
+    ap.add_argument('--pgo', metavar='gen|FILE',
+                    help='profile-guided optimisation. gen builds an instrumented ocarina.exe (Windows: needs '
+                         '--toolchain, an llvm-mingw that has the profile runtime). FILE compiles with that '
+                         '.profdata. Without --fast the lifted code is compiled at -O2; --fast keeps -O3')
+    ap.add_argument('--toolchain', type=Path,
+                    help='with --pgo gen: llvm-mingw directory (bin/clang.exe). Headers and libraries stay MSYS2\'s')
     ap.add_argument('--events', action='store_true', help='machine-readable progress lines on stdout ("@@" + JSON)')
     ap.add_argument('--make-runtime-lib', metavar='DIR', help='build the prebuilt runtime library of a release into DIR')
     ap.add_argument('--obj', help='with --make-runtime-lib: the folder for its objects')
@@ -2283,7 +2416,16 @@ def build_main():
     jobs_why = '--jobs'
     if not a.jobs or a.jobs < 1:
         a.jobs, jobs_why = default_jobs()
+        if a.fast:
+            # -O3 of a lifted file is larger than the -O1 peak the budget was set for. Half is a guard, not a measured
+            # peak; --jobs overrides it.
+            a.jobs = max(1, a.jobs // 2)
+            jobs_why += ('; the fast profile runs half of those at once (pass --jobs to choose; the half is a guard, '
+                         'not a measured peak)')
     if a.make_runtime_lib:
+        if a.fast or a.pgo or a.march or a.toolchain:
+            fail('--make-runtime-lib builds the generic runtime library a release ships. '
+                 'It does not take --fast, --march, --pgo or --toolchain.')
         make_runtime_lib(a.make_runtime_lib, Path(a.msys), a.jobs, a.obj)
         return
     given = bool(a.nup) + bool(a.exefs or a.romfs) + bool(a.rebuild)
@@ -2335,21 +2477,38 @@ def build_main():
     keep_awake()
     # What can be known to fail later is looked at now: the disk space of every step that will run, and on Windows
     # that the build tools compile and link (not for a build the tests stop before its compile step, --until)
-    ahead = steps_to_run(state, src.identity, out, a.until)
+    opts = build_opts(a, out)
+    tag = opts.tag if opts else ''
+    ahead = steps_to_run(state, src.identity, out, a.until, tag)
     check_space(out, space_needs(ahead, out, sum(src.romfs_size(ref) for _, ref in src.romfs) if 'romfs' in ahead else 0,
                                  a.rebuild and shader_carry(out)))
     if WIN and 'compile' in ahead:
-        probe_toolchain(msys, cache / 'toolchain-check')
+        # The default call stays (msys, work): tests replace probe_toolchain with a function of those two arguments.
+        if opts and (opts.fast or opts.pgo == 'gen' or opts.toolchain):
+            extra_c, extra_ld = [], []
+            probe_cc = probe_cxx = probe_env = None
+            if opts.fast:
+                extra_c += ['-O3', '-flto=thin', '-fno-plt']
+                extra_ld += ['-flto=thin']
+            if opts.pgo == 'gen':
+                extra_c += ['-fprofile-generate']
+                extra_ld += ['-fprofile-generate']
+            if opts.toolchain:
+                probe_cc, probe_cxx, probe_env, _ = toolchain(msys, opts.toolchain)
+            probe_toolchain(msys, cache / 'toolchain-check', probe_cc, probe_cxx, probe_env, extra_c, extra_ld)
+        else:
+            probe_toolchain(msys, cache / 'toolchain-check')
     # Linux: the compiler, headers and libraries are the system's, so they are tried on the runtime before the long
     # steps of a build that will reach the compile step (the first step whose key is not current makes the rest run)
-    if not WIN and any(state['steps'].get(n) != step_key(n, src.identity, out) for n in STEPS[:STEPS.index('compile') + 1]):
-        preflight(msys, a.jobs)
+    if not WIN and any(state['steps'].get(n) != step_key(n, src.identity, out, tag)
+                       for n in STEPS[:STEPS.index('compile') + 1]):
+        preflight(msys, a.jobs, opts=opts)
     say(f'compiles at a time: {a.jobs} ({jobs_why})')
     t0 = time.time()
     romfs_job = None
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
             'lift': lambda: step_lift(out, cache),
-            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune),
+            'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune, opts),
             'shaders': lambda: step_shaders(out, a.rebuild), 'prompts': lambda: step_prompts(out),
             'scan': lambda: step_scan(out)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
@@ -2371,7 +2530,7 @@ def build_main():
         t = time.time()
         runs[name]()
         with state_lock:
-            state['steps'][name] = step_key(name, src.identity, out)
+            state['steps'][name] = step_key(name, src.identity, out, tag)
         save()
         say(f'{name}: {time.time() - t:.0f} s')
         emit('step', step=name, state='done', seconds=round(time.time() - t, 1))
@@ -2380,14 +2539,14 @@ def build_main():
         # Keep Build Cache off (the launcher) deletes the lift and the objects after a build and keeps this state:
         # the lift's key still matches then, and a compile step that runs would find no lifted code to compile
         return (name == 'lift' and not (cache / 'lift' / 'layout.json').is_file()
-                and state['steps'].get('compile') != step_key('compile', src.identity, out))
+                and state['steps'].get('compile') != step_key('compile', src.identity, out, tag))
 
     try:
         for name in STEPS:
             if name == 'prompts' and not prompt_art_dir():
                 say('prompts: none to draw, the kit has no button art')
                 emit('step', step=name, state='skip')
-            elif state['steps'].get(name) == step_key(name, src.identity, out) and not lift_gone(name):
+            elif state['steps'].get(name) == step_key(name, src.identity, out, tag) and not lift_gone(name):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:

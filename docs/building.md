@@ -105,10 +105,15 @@ of them.
    the headers that are missing or stale.
 
    `--cpu v2` targets x86-64-v2 (SSE4.2, no AVX2/FMA) for older CPUs; the default `v3` needs AVX2. The v2 build links
-   `runtime/fma.c`, a correctly rounded software fma the FP lowering needs, and runs slower. Inline assembly,
+   `runtime/fma.c`, a correctly rounded software fma the FP lowering needs, and runs slower.    Inline assembly,
    target attributes and intrinsics are not bound by `-march`, so a v2 build runs `tools/check_isa.py` over the runtime
    objects before it links: any AVX, BMI or other instruction above x86-64-v2 outside a function listed there as
    dispatched by a runtime CPU check stops the build.
+
+   `--fast` is an optional profile (thin LTO, `-O3`, `-fno-plt`, no asserts). It does not change the flags above.
+   The player build (`tools/make_game.py --fast`) is the one that produces `ocarina.exe` from a 1.1.1 dump.
+   [BUILD_FAST.md](../BUILD_FAST.md) has the Windows commands, what each flag does today, and the profile-guided
+   steps. Nothing in that profile has a measured frame time on the 7700X yet.
 
    `gen.py` sizes its emit pool from the CPU count and the free memory; `--jobs N` sets it, and so does the environment variable `NX2NAVI_LIFT_JOBS=N`, which the installer's lift step honours too (it has no `--jobs`). When a worker runs out of memory, the pool restarts with half the workers (`emit: out of memory with N workers, retrying with M`), down to one; only an out-of-memory error with one worker fails the step.
 
@@ -206,7 +211,9 @@ bench ran 12-15% faster per frame and a fight outside the training about 6%. The
 
 A profile only fits the generated C it was trained on: functions are matched by name and control-flow hash, so a
 function whose C changes loses its counts without a warning. Retrain after a lifter or generator change, from a clean
-`recomp/`. The instrumented build needs llvm-mingw, as MSYS2's clang has no profile runtime:
+`recomp/`. The instrumented build needs llvm-mingw, as MSYS2's clang has no profile runtime. The 1.1.1 player build
+(`tools/make_game.py`) takes the same two steps, with `--pgo gen` and `--pgo FILE`; the commands and the Hyrule Field
+training are in [BUILD_FAST.md](../BUILD_FAST.md). The gain quoted above is the 1.4.3 fight bench, not a Hyrule Field run.
 
 ```powershell
 $llvm = "toolchain\llvm-mingw-<date>\llvm-mingw-<date>-ucrt-x86_64"
