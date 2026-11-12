@@ -2488,8 +2488,7 @@ def build_main():
             extra_c, extra_ld = [], []
             probe_cc = probe_cxx = probe_env = None
             if opts.fast:
-                extra_c += ['-O3', '-flto=thin', '-fno-plt']
-                extra_ld += ['-flto=thin']
+                extra_c += ['-O3', '-fno-plt']
             if opts.pgo == 'gen':
                 extra_c += ['-fprofile-generate']
                 extra_ld += ['-fprofile-generate']

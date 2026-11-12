@@ -7,9 +7,16 @@ BUILD_FAST.md is the Windows guide: what the default compiles with, the commands
 FAST_OPT = '-O3'
 # -fomit-frame-pointer is already what clang does at -O1 and above on x86-64. It is named here so the profile says so.
 # -DNDEBUG compiles out assert(). The runtime's own checks are rt_fatal and stay; perf traces stay too.
-# -flto=thin is the form that links. Full -flto of the lifted code is not this profile.
-FAST_CFLAGS = ('-fomit-frame-pointer', '-fno-plt', '-DNDEBUG', '-flto=thin')
-FAST_LDFLAGS = ('-flto=thin',)
+# -flto=thin needs lld: GNU ld cannot load LLVMgold.dll from the launcher's MSYS2 UCRT64 toolchain (no ld.lld there),
+# so the probe link fails. LTO is only added when ld.lld is next to clang (lto_ok).
+FAST_CFLAGS = ('-fomit-frame-pointer', '-fno-plt', '-DNDEBUG')
+FAST_LDFLAGS = ()
+LTO_FLAG = '-flto=thin'
+
+
+def lto_ok(bindir):
+    import os
+    return os.path.isfile(os.path.join(str(bindir), 'ld.lld.exe')) or os.path.isfile(os.path.join(str(bindir), 'ld.lld'))
 
 # --march names. v3 and v4 are the x86-64 levels; znver4 also schedules for Zen 4.
 MARCHES = {
@@ -123,7 +130,7 @@ def profile_tag(fast, march_name, pgo_kind, pgo_digest=''):
 def describe(fast, march_text, pgo_kind):
     parts = []
     if fast:
-        parts.append('-O3 -flto=thin -fno-plt -fomit-frame-pointer -DNDEBUG, march ' + march_text)
+        parts.append('-O3 -fno-plt -fomit-frame-pointer -DNDEBUG, march ' + march_text)
     if pgo_kind == 'gen':
         parts.append('instrumented (-fprofile-generate)')
     elif pgo_kind == 'use':
