@@ -302,6 +302,10 @@
 # and the pool wrote nothing since. 0 (default) binds it on every draw that is not skipped whole. ab follows the A/B
 # blocks. The pictures must match; the gain on the replay thread is not measured yet.
 # pool_bind_skip = 0
+# 1: after a submission's first texture-pool refresh, later refreshes in that submission are not walked. The draws keep
+# the first refresh's descriptors; a texture registered in the middle of the submission can be missing until the next
+# one. 0 (default) walks them, as before. ab follows the A/B blocks. Look for missing textures before keeping it.
+# pool_mid_skip = 0
 # shader_memo = 1
 # 1 flushes every shader cache file to the disk before it is used, as earlier versions did; 0 (default) flushes only
 # the stored game code, which makes shader preparation about twice as fast (a torn file is translated again).

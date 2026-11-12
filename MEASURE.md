@@ -141,34 +141,33 @@ Les deux lancements sont l’exe 0.8.0 déjà installé. Rien n’a été recomp
 
 En forêt Kokiri installée, ce log-ci n’est pas limité par le replay : 0,20 ms de replay et le plafond 240. Le replay à 6–9 ms, les ~200 syncs et les ~65 flush sont la plaine, pas Kokiri. Gain de `pool_bind_skip` : **non mesuré**.
 
-## 8. Branche replay : `cursor/pool-bind-skip-7f0d`
+## 8. Protocole Plaine, une clé à la fois (exe 0.8.0 déjà installé)
 
-`pool_bind_skip = 0` par défaut. À 1, un draw ne réenregistre pas le bind du set de textures si ce command buffer a déjà ce set et que le pool n’a rien écrit (`runtime/vk_exec_draw.c`, `bind_resources`). Le chemin à 0 appelle `vkCmdBindDescriptorSets` comme avant.
+Même sauvegarde, même point de la plaine d’Hyrule (le log doit dire `HyruleField_Child settled`), 20 s après le chargement, 60 s à marcher le même chemin. `trace = perf` et `replay_time = 1` restent. Une seule ligne change. Ordre A, B, B, A. Note `replay avg`, le fps de la ligne `perf: frame`, et `bound:`. Pas d’image noire, pas de texture manquante, pas de carrés dans la lumière.
 
-Copie d’abord `D:\Games\NX2navi\ocarina.exe` vers `ocarina-stock.exe`.
+Les chiffres du log 23:55, pour savoir ce qu’on cherche. En Kokiri installée (image 1560) le replay est **0,20 ms** et le jeu est au plafond **240**. En plaine (image 5100) le replay est **6,61 ms**, 75,2 images/s, `bound: cpu`, le GPU attend la soumission **6,07 ms**. Le budget 5 ms puis 3,5 ms n’est pas mesuré : c’est la cible.
+
+1. `replay_async = 1` contre 0. Le replay passe sur un autre thread, au plus une image derrière (`runtime/vk_backend.c` `vk_replay_async`). Le jeu peut avancer pendant que le replay enregistre. Risque écrit dans le code et l’ini : jusqu’à une image de latence, images sombres ou qui clignotent, carrés dans les rayons (issues #548 et #543). **À tester en premier** sur l’exe actuel, sans recompiler. Si l’image casse, remets 0.
+2. `one_per_core = ab` et `ab = 20`. Un thread logique par cœur physique (`runtime/perf.c` `cpu_placement`). Le 7700X a 8 cœurs. Le commentaire du code parle d’un gain rapporté sur un CPU SMT à 8 cœurs : **non mesuré ici**. Pas de changement d’image attendu. Le `cache_die` par défaut ne change rien sur un seul CCD.
+3. `dlaa_objmv = 0` contre 1. Chaque draw indexé passe dans le contrôle de mouvement par objet (`runtime/vk_exec_draw.c` `mvobj_draw`). Le log 23:55 n’a **aucune** ligne `per-object motion`, donc ce coût est **non mesuré**. Les personnages qui bougent peuvent laisser une traînée.
+4. Seulement après une compilation de la branche `cursor/replay-field-7f0d` : `pool_bind_skip = ab` seul, puis `pool_mid_skip = ab` seul. `pool_mid_skip` peut laisser une texture absente jusqu’à la soumission suivante. Si tu en vois, remets 0.
+
+`binding storage checks` du log (par exemple 29 568 à l’image 5640) est la **somme des 60 images** de la fenêtre : le compteur est remis à zéro à chaque ligne (`runtime/vk_texture.c` vers 4100-4103). Ce n’est pas 30 000 contrôles par image. 29 568 / 60 ≈ 493 par image. Les requêtes write-watch de cette ligne (420) sont aussi sur la fenêtre. Les « queries … pre-snap » de la ligne `mem: mirror` sont un autre compteur, déjà en « par frame ».
+
+Entre les images 3720 et 5640 le log compte 3 600 changements de set de pool (7 200 − 3 600). La moyenne cumulée à ce moment est 0,563 ms de rafraîchissement et 0,085 ms de rattrapage par changement (`vk: texture pool sets`, vers la ligne 3520). 3 600 / 1 920 images ≈ 1,9 changement par image. Le produit ≈ 1,2 ms par image est un **calcul à partir de ces deux chiffres**, pas une ligne du log, et la moyenne cumulée mélange le début de partie.
+
+## 9. Pas d’ocarina.exe à télécharger
+
+Un `ocarina.exe` jouable est le code du jeu relevé depuis **ton** dump, lié au runtime. Le dépôt ne contient pas le dump, et il ne doit pas le contenir. La CI du dépôt construit l’AppImage Linux du kit, sans fichiers du jeu (`.github/workflows/linux-appimage.yml`). Cette machine n’a pas le toolchain MSYS2 UCRT64 ni les en-têtes Vulkan du build Windows. Je ne peux donc pas produire l’exe.
+
+Pour le construire chez toi, après avoir copié `ocarina.exe` vers `ocarina-stock.exe` :
 
 ```bat
-git clone --branch cursor/pool-bind-skip-7f0d https://github.com/Samet-stack/NX2navi.git D:\src\NX2navi-replay
+git clone --branch cursor/replay-field-7f0d https://github.com/Samet-stack/NX2navi.git D:\src\NX2navi-replay
 cd /d D:\src\NX2navi-replay
 py -I tools\make_game.py --rebuild --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
 ```
 
-Le dépôt n’a pas `libnx2navirt.a` : le log de compile doit dire que `runtime/` est compilé, pas « the runtime comes prebuilt ». Si `--rebuild` refuse, utilise `--exefs D:\Games\NX2navi\exefs --romfs D:\Games\NX2navi\romfs --out D:\Games\NX2navi-replay` et copie `nx2navi.ini` plus `profile`.
+Le dépôt n’a pas `libnx2navirt.a`, donc le log doit compiler `runtime/`, pas dire « the runtime comes prebuilt ». Si `--rebuild` refuse, ajoute `--exefs D:\Games\NX2navi\exefs --romfs D:\Games\NX2navi\romfs`. Pour revenir : recopie `ocarina-stock.exe` sur `ocarina.exe`.
 
-Même ini que le lancement 23:55 (`trace = perf`, `replay_time = 1`). Ajoute seulement :
-
-```ini
-[performance]
-pool_bind_skip = ab
-
-[diagnostics]
-ab = 20
-```
-
-Même sauvegarde. 60 s en forêt Kokiri installée (devant la maison), puis 60 s au même endroit dans la plaine (le log doit dire `HyruleField_Child settled`). Pas de carrés ni d’image noire. Puis :
-
-```bat
-py -I tools\ab_summary.py D:\Games\NX2navi\logs\nx2navi.log
-```
-
-Note `replay avg` et `bound` des fenêtres A et B. Reviens avec `pool_bind_skip = 0`, ou en recopiant `ocarina-stock.exe` sur `ocarina.exe`.
+La nouvelle ligne, avec `trace = perf`, s’appelle `perf: frame … draws recorded`. Elle donne, par fenêtre de 60 images, le temps de `bind_resources`, du mémo de pipeline, du mémo de shaders, de `pool_sync` et du contrôle de mouvement. `pool_bind_skip` et `pool_mid_skip` sont à 0 dans cette branche tant que tu ne les mets pas.

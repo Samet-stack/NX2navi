@@ -101,6 +101,41 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     nfw = 0;
 }
 
+// Deltas of the draw-path counters since the previous call. trace=perf adds the hit counts and the two clocks;
+// trace=gfx also clears the struct at each present, and a counter that went backwards is taken as that clear.
+void vk_exec_perf_draw_log(uint64_t frame, uint64_t nframes) {
+    VkExecFrame *f = &vk_exec_frame;
+    static VkExecFrame prev;
+    uint64_t d_draws = f->draws >= prev.draws ? f->draws - prev.draws : f->draws;
+    uint64_t d_seen = f->draws_seen >= prev.draws_seen ? f->draws_seen - prev.draws_seen : f->draws_seen;
+    uint64_t d_bind = f->bind_calls >= prev.bind_calls ? f->bind_calls - prev.bind_calls : f->bind_calls;
+    uint64_t d_bskip = f->bind_skipped >= prev.bind_skipped ? f->bind_skipped - prev.bind_skipped : f->bind_skipped;
+    uint64_t d_bns = f->bind_ns >= prev.bind_ns ? f->bind_ns - prev.bind_ns : f->bind_ns;
+    uint64_t d_tex = f->bind_tex_ns >= prev.bind_tex_ns ? f->bind_tex_ns - prev.bind_tex_ns : f->bind_tex_ns;
+    uint64_t d_buf = f->bind_buf_ns >= prev.bind_buf_ns ? f->bind_buf_ns - prev.bind_buf_ns : f->bind_buf_ns;
+    uint64_t d_sig = f->bind_sig_ns >= prev.bind_sig_ns ? f->bind_sig_ns - prev.bind_sig_ns : f->bind_sig_ns;
+    uint64_t d_push = f->bind_push_ns >= prev.bind_push_ns ? f->bind_push_ns - prev.bind_push_ns : f->bind_push_ns;
+    uint64_t d_ph = f->pipe_hit >= prev.pipe_hit ? f->pipe_hit - prev.pipe_hit : f->pipe_hit;
+    uint64_t d_pm = f->pipe_miss >= prev.pipe_miss ? f->pipe_miss - prev.pipe_miss : f->pipe_miss;
+    uint64_t d_sh = f->sh_hit >= prev.sh_hit ? f->sh_hit - prev.sh_hit : f->sh_hit;
+    uint64_t d_sm = f->sh_miss >= prev.sh_miss ? f->sh_miss - prev.sh_miss : f->sh_miss;
+    uint64_t d_pool = f->pool_ns >= prev.pool_ns ? f->pool_ns - prev.pool_ns : f->pool_ns;
+    uint64_t d_mv = f->mv_ns >= prev.mv_ns ? f->mv_ns - prev.mv_ns : f->mv_ns;
+    uint64_t d_mid = f->pool_mid >= prev.pool_mid ? f->pool_mid - prev.pool_mid : f->pool_mid;
+    prev = *f;
+    if (!nframes) return;
+    double n = (double)nframes;
+    rt_log("perf: frame %llu: over %llu frames, draws recorded %llu, seen %llu; bind_resources %llu (skipped %llu), "
+           "per frame %.2f ms (tex %.2f, buf %.2f, sig %.2f, push %.2f); pipe memo hit %llu, lookup %llu; "
+           "shader memo hit %llu, miss %llu; pool_sync %.2f ms a frame; motion check %.2f ms a frame; "
+           "mid-submission pool refreshes skipped %llu",
+           (unsigned long long)frame, (unsigned long long)nframes, (unsigned long long)d_draws, (unsigned long long)d_seen,
+           (unsigned long long)d_bind, (unsigned long long)d_bskip, d_bns / 1e6 / n, d_tex / 1e6 / n, d_buf / 1e6 / n,
+           d_sig / 1e6 / n, d_push / 1e6 / n, (unsigned long long)d_ph, (unsigned long long)d_pm,
+           (unsigned long long)d_sh, (unsigned long long)d_sm, d_pool / 1e6 / n, d_mv / 1e6 / n,
+           (unsigned long long)d_mid);
+}
+
 WEAK void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     (void)ex, (void)payload;
     rt_fatal("vk: op %s is not replayed yet", nvn_op_name(op));

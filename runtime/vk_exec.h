@@ -201,12 +201,20 @@ typedef struct {
     uint64_t bind_sig_ns;                // of bind_ns, the per-draw binding signature
     uint64_t bind_push_ns;               // of bind_ns, the set packing, pushes and binds after the binding loop
     uint64_t bind_reused, bind_resolved; // descriptors taken from the per-binding reuse (PB) and resolved again
+    uint64_t bind_skipped;               // bind_resources returned before building (bind_skip)
     uint64_t dyn_calls, dyn_left;        // dynamic state calls recorded, and left out as unchanged (B.dyn)
+    uint64_t pipe_hit, pipe_miss;        // prepare_draw_ex: pipeline memo hit, or a lookup
+    uint64_t sh_hit, sh_miss;            // shader memo hit, or a shader_for
+    uint64_t pool_ns;                    // pool_sync inside bind_resources, while NX2NAVI_TRACE includes perf
+    uint64_t mv_ns;                      // per-object motion check on indexed draws, same trace
+    uint64_t pool_mid;                   // NX2NAVI_POOL_MID_SKIP: mid-submission pool refreshes not walked
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
 uint64_t vk_exec_recording_fence(void);                        // fence of the submission this thread records, else 0
 void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
+// NX2NAVI_TRACE=perf, every 60 frames (perf.c): how the replay's draw path split since the previous line.
+void vk_exec_perf_draw_log(uint64_t frame, uint64_t nframes);
 // The draws skipped since the last call because a shader or pipeline was still building (vk_exec_draw.c), and whether
 // a frame lacking them would be held back at its present (vk_backend.c frame_hold).
 uint32_t vk_exec_pending_draws_take(void);

@@ -2371,6 +2371,20 @@ static int pool_bind_skip_on(void) {
     return RT_KNOB_ON(mode);
 }
 
+// NX2NAVI_POOL_MID_SKIP (default 0; ab = on in the B blocks): a submission's first pool refresh still walks the dirty
+// slots. Later refreshes in that same submission (the slot generation moved, the epoch did not) are not walked: the
+// draws keep the descriptors of the first refresh, and the skipped registrations are applied at the next submission's
+// refresh. A texture the game registers in the middle of a submission can be missing until that next submission.
+static int pool_mid_skip_on(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("POOL_MID_SKIP", "0");
+        if (mode == 1) rt_log("vk_exec: pool refreshes after a submission's first are left until the next submission (NX2NAVI_POOL_MID_SKIP)");
+        else if (mode == 2) rt_log("vk_exec: pool refreshes after a submission's first are left until the next submission, in the B blocks (NX2NAVI_POOL_MID_SKIP=ab)");
+    }
+    return RT_KNOB_ON(mode);
+}
+
 static void pool_sync(VkExec *ex) {
     if (!PL.layout) vk_pool_set_layout();
     uint64_t from = 0, pre = PL.logn;
@@ -2507,6 +2521,14 @@ static void pool_sync_entries(VkExec *ex) {
     uint32_t used = __atomic_load_n(&vk_pool_kinds_used, __ATOMIC_RELAXED);
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();
     if (PL.ready && !PL.retry && used == PL.kinds && gen == PL.gen && ep == PL.epoch && sg == PL.sgen) return;
+    // Only a slot-generation change inside the submission the last refresh already served. The walk below is what the
+    // "within one" dirty-walk line counts. Leaving it out does not touch a new submission (the epoch still differs).
+    if (pool_mid_skip_on() && PL.ready && !PL.retry && !(used & ~PL.kinds) && ep == PL.epoch && sg == PL.sgen &&
+        gen != PL.gen) {
+        PL.gen = gen;
+        vk_exec_frame.pool_mid++;
+        return;
+    }
     int spent = pool_create_ns() && PL.frame_ns >= pool_create_ns();   // this frame creates nothing more
     if (spent && PL.ready && used == PL.kinds && gen == PL.gen && ep == PL.epoch && sg == PL.sgen) return;   // left slots only
     vk_texture_lock();
@@ -3262,6 +3284,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (same && was_valid && skip == 1) {
             for (int i = 0; i < RS.ncnt; i++) vk_mem_count(RS.cnt[i].cls, RS.cnt[i].use, RS.cnt[i].bytes);
             BS.bind_skip++;
+            if (rt_trace & RT_TRACE_PERF) vk_exec_frame.bind_skipped++;
             ex->recorded++;
             return;
         }
@@ -3435,7 +3458,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     if (info->pool) {   // set 2: the texture and sampler pools
         uint64_t log0 = PL.logn;
         VkDescriptorSet set0 = PL.set;
+        uint64_t pool_t0 = (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0;
         pool_sync(ex);
+        if (pool_t0) vk_exec_frame.pool_ns += kern_now_ns() - pool_t0;
         int skip_on = pool_bind_skip_on();
         int same = skip_on && B.pool_set && B.pool_set == PL.set && B.pool_layout == info->layout &&
                    PL.set == set0 && PL.logn == log0;
@@ -3948,6 +3973,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     const GfxShader *vs, *fs, *ts = NULL;
     uint32_t gen = memo ? vk_texture_slots_gen() : 0;   // before shader_for, whose lookups may bump it
     if (memo && SM.valid && memo_match(ex, gen, &SM.k)) {
+        if (rt_trace & RT_TRACE_PERF) vk_exec_frame.sh_hit++;
         vs = SM.vs, fs = SM.fs, has_vs = 1, has_fs = SM.has_fs;
         if (memo == 2) {
             int hv, hf, wv, wf;
@@ -3956,6 +3982,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
                 rt_fatal("vk_exec: shader memo of program %llu differs from the lookup", (unsigned long long)ex->prog->serial);
         }
     } else {
+        if (memo && (rt_trace & RT_TRACE_PERF)) vk_exec_frame.sh_miss++;
         SM.valid = 0;
         if (fb) vs = mfb_cur_vs, has_vs = 1;
         else vs = shader_for(ex, vst, &has_vs, &vs_wait, 0);
@@ -4036,9 +4063,11 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     uint64_t w0 = 0, m0 = 0;   // m0: when the lookup missed (wait_note)
     int kind = WK_LINK;
     if (pipe_memo_on() && PM.valid && !memcmp(&PM.s, &s, sizeof s)) {
+        if (rt_trace & RT_TRACE_PERF) vk_exec_frame.pipe_hit++;
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
     } else {
+        if (rt_trace & RT_TRACE_PERF) vk_exec_frame.pipe_miss++;
         // Nearly every draw finds its pipeline, so the first lookup waits for nothing and the clock is read only for a
         // draw that missed. A miss first has the rest of the submission read ahead (vk_exec_ahead: the stage libraries
         // of the later draws' pipelines build on the workers from here on), inside this draw's wait budget.
@@ -4537,10 +4566,13 @@ static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSiz
     if (MO.failed || !vk_mvprev_on() || !B.st_valid) return;
     static int timed = -1;
     if (timed < 0) timed = rt_knob("MVOBJ_TIMES", "0");   // NX2NAVI_MVOBJ_TIMES=1: the summary's times (the clock reads cost)
-    if (!timed) return mvobj_draw_(ex, d, ib, ib_off, 0);
+    // NX2NAVI_TRACE=perf times the same check into the 60-frame line. The clock is not read when that trace is off.
+    if (!timed && !(rt_trace & RT_TRACE_PERF)) return mvobj_draw_(ex, d, ib, ib_off, 0);
     uint64_t t0 = kern_now_ns();
-    mvobj_draw_(ex, d, ib, ib_off, t0);
-    MO.ns_check += kern_now_ns() - t0;
+    mvobj_draw_(ex, d, ib, ib_off, timed ? t0 : 0);
+    uint64_t dt = kern_now_ns() - t0;
+    MO.ns_check += dt;
+    if (rt_trace & RT_TRACE_PERF) vk_exec_frame.mv_ns += dt;
 }
 
 // NX2NAVI_MVOBJ_BANKS=1 (test): for scene draws, the words of each other uniform bank (c3, c6, c8-c16) that changed
