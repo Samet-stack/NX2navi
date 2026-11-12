@@ -150,7 +150,12 @@ Les chiffres du log 23:55, pour savoir ce qu’on cherche. En Kokiri installée 
 1. `replay_async = 1` contre 0. Le replay passe sur un autre thread, au plus une image derrière (`runtime/vk_backend.c` `vk_replay_async`). Le jeu peut avancer pendant que le replay enregistre. Risque écrit dans le code et l’ini : jusqu’à une image de latence, images sombres ou qui clignotent, carrés dans les rayons (issues #548 et #543). **À tester en premier** sur l’exe actuel, sans recompiler. Si l’image casse, remets 0.
 2. `one_per_core = ab` et `ab = 20`. Un thread logique par cœur physique (`runtime/perf.c` `cpu_placement`). Le 7700X a 8 cœurs. Le commentaire du code parle d’un gain rapporté sur un CPU SMT à 8 cœurs : **non mesuré ici**. Pas de changement d’image attendu. Le `cache_die` par défaut ne change rien sur un seul CCD.
 3. `dlaa_objmv = 0` contre 1. Chaque draw indexé passe dans le contrôle de mouvement par objet (`runtime/vk_exec_draw.c` `mvobj_draw`). Le log 23:55 n’a **aucune** ligne `per-object motion`, donc ce coût est **non mesuré**. Les personnages qui bougent peuvent laisser une traînée.
-4. Seulement après une compilation de la branche `cursor/replay-field-7f0d` : `pool_bind_skip = ab` seul, puis `pool_mid_skip = ab` seul. `pool_mid_skip` peut laisser une texture absente jusqu’à la soumission suivante. Si tu en vois, remets 0.
+4. Seulement après une compilation de la branche `cursor/replay-field-7f0d`. Une clé à la fois, les autres à 0. Même point, 60 s, ordre A B B A. Lis la ligne `perf: frame … draws recorded` (section 10). Si une image casse, remets la clé à 0 avant la suivante.
+   - `pipe_stamp = ab`. Chaque draw compare tout l’état du pipeline (`VkPipeState`, `runtime/vk_exec_draw.c` `prepare_draw_ex`). La clé saute cette comparaison quand le tampon correspond. Risque : un blend, une profondeur ou un format de sommets faux si une écriture n’a pas été comptée. Regarde la lumière et les arêtes.
+   - `pool_mid_skip = ab`. Risque : une texture absente jusqu’à la soumission suivante.
+   - `pool_bind_skip = ab`. Risque visuel faible si le set n’a pas changé. Les images doivent être identiques. Gain : **non mesuré**.
+   - `mvobj_fast = ab`, seulement si la ligne affiche un temps de `motion check` supérieur à 0. Sinon le contrôle ne coûte rien dans cette scène et le test ne sert à rien. Risque : un objet qui bouge suit le mouvement de la caméra (traînée).
+   - `ix_reuse = ab`, seulement si la ligne affiche des `index lists` en nombre. La fréquence des quads est **non mesuré** tant que ce compteur est à 0. Risque : des trous dans les quads ou les boucles de lignes.
 
 `binding storage checks` du log (par exemple 29 568 à l’image 5640) est la **somme des 60 images** de la fenêtre : le compteur est remis à zéro à chaque ligne (`runtime/vk_texture.c` vers 4100-4103). Ce n’est pas 30 000 contrôles par image. 29 568 / 60 ≈ 493 par image. Les requêtes write-watch de cette ligne (420) sont aussi sur la fenêtre. Les « queries … pre-snap » de la ligne `mem: mirror` sont un autre compteur, déjà en « par frame ».
 
@@ -170,4 +175,32 @@ py -I tools\make_game.py --rebuild --out D:\Games\NX2navi --msys "%LOCALAPPDATA%
 
 Le dépôt n’a pas `libnx2navirt.a`, donc le log doit compiler `runtime/`, pas dire « the runtime comes prebuilt ». Si `--rebuild` refuse, ajoute `--exefs D:\Games\NX2navi\exefs --romfs D:\Games\NX2navi\romfs`. Pour revenir : recopie `ocarina-stock.exe` sur `ocarina.exe`.
 
-La nouvelle ligne, avec `trace = perf`, s’appelle `perf: frame … draws recorded`. Elle donne, par fenêtre de 60 images, le temps de `bind_resources`, du mémo de pipeline, du mémo de shaders, de `pool_sync` et du contrôle de mouvement. `pool_bind_skip` et `pool_mid_skip` sont à 0 dans cette branche tant que tu ne les mets pas.
+La nouvelle ligne, avec `trace = perf`, s’appelle `perf: frame … draws recorded`. Le détail est en section 10. Toutes les clés de cette branche sont à 0 tant que tu ne les mets pas.
+
+## 10. Clés de la branche replay, et ce que la ligne mesure
+
+Toutes sont à 0 par défaut. Le chemin par défaut ne change pas. `ab` suit les blocs A/B (`ab = 20` dans l’ini, ordre A B B A). Aucun gain en millisecondes n’est mesuré : la cible 5 ms puis 3,5 ms de replay en plaine n’est pas un résultat.
+
+| Clé | Défaut | Risque visuel | Ce que le code évite |
+| --- | --- | --- | --- |
+| `pool_bind_skip` | 0 | faible si le set est le même : les images doivent rester identiques | `vkCmdBindDescriptorSets` du set de pool quand le set, le layout et le journal n’ont pas changé |
+| `pool_mid_skip` | 0 | une texture peut manquer jusqu’à la soumission suivante | la marche des slots sales après le premier rafraîchissement d’une soumission |
+| `pipe_stamp` | 0 | mauvais pipeline : blend, profondeur ou sommets faux. Regarde la lumière et les arêtes | le `memcmp` de tout `VkPipeState` quand le tampon et les champs du draw correspondent. Les draws mesh comparent encore |
+| `ix_reuse` | 0 | des trous dans les quads ou les boucles de lignes | le `malloc`/`free` de la liste d’index. `bind_index` copie les octets avant le retour |
+| `mvobj_fast` | 0 | un objet mobile peut suivre le mouvement caméra (traînée) | la marche des ressources d’un vertex shader qui ne lit aucun bank objet. Le pointeur est revérifié avec la clé du shader |
+
+Ordre de test : d’abord les trois essais sans recompiler de la section 8 (`replay_async`, `one_per_core`, `dlaa_objmv`), puis les clés compilées dans l’ordre du point 4. Une seule clé à la fois.
+
+La ligne `perf: frame N: over … frames, draws recorded …` donne, en moyenne par image de la fenêtre :
+
+- `bind_resources` en ms. Ce total est rempli avec `trace = perf` seul (`bind_span_now` dans `runtime/vk_exec_draw.c`). Avant, il restait à 0,00 : `bt_now` ne tourne qu’avec `trace = gfx`.
+- entre parenthèses, `tex`, `buf`, `sig`, `push`. Ces quatre restent à 0,00 tant que `trace` ne contient pas `gfx` : une horloge par descripteur coûte plus que le travail mesuré. Le total `bind_resources` les contient déjà, y compris `pool_sync`.
+- `pipe memo hit`, dont `stamp` (ceux qui ont sauté le `memcmp`), `lookup`, et les ms du mémo ou de la recherche.
+- `shader memo hit` et `miss`.
+- `pool_sync` en ms. C’est dedans le total `bind_resources`, pas en plus.
+- `motion check` en ms.
+- `binding snap` en ms : le temps passé dans `vk_mem_changed_snap` depuis `make_fresh_snap` (`runtime/vk_texture.c`). Le nombre de contrôles de la ligne `binding storage checks` reste une somme de fenêtre, pas un nombre par image (section 8).
+- `index lists` : combien de listes quad, line-loop ou byte ont été construites dans la fenêtre, pas par image.
+- `mid-submission pool refreshes skipped` : le compteur de `pool_mid_skip` sur la fenêtre.
+
+Les descripteurs passent déjà par les templates et les push descriptors quand le pilote les a (`runtime/vk_pipeline.c`, `desc_template` vaut 1 par défaut). Cette branche n’y touche pas. Le coût de `bind_resources` une fois le total non nul est **non mesuré** tant que tu n’as pas relancé.

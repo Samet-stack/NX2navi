@@ -3111,8 +3111,12 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
 }
 
 // The binding profile in the NX2NAVI_TRACE=gfx frame line reads the clock around every descriptor; without the trace
-// those reads would cost more than some of what they time, so they read 0.
+// those reads would cost more than some of what they time, so they read 0. The span around bind_resources itself is
+// timed for trace=perf too (bind_span_now): one clock per draw, which is what the perf line's bind total needs.
 static inline uint64_t bt_now(void) { return rt_trace & RT_TRACE_GFX ? plat_now_ns() : 0; }
+static inline uint64_t bind_span_now(void) {
+    return rt_trace & (RT_TRACE_GFX | RT_TRACE_PERF) ? kern_now_ns() : 0;
+}
 
 // ---- per-binding descriptor reuse
 // A graphics draw whose inputs differ from the previous draw's in one binding (the whole-draw skip, bind_sig, misses it)
@@ -3802,11 +3806,25 @@ static int shader_memo_on(void) {
     return SM.on;
 }
 
-static struct { int on, valid; VkPipeState s; const VkPipeInfo *info; } PM = {-1};
+static struct { int on, valid; uint32_t stamp; VkPipeState s; const VkPipeInfo *info; } PM = {-1};
 
 static int pipe_memo_on(void) {
     if (PM.on < 0) PM.on = cfg_bool("NX2NAVI_PIPE_MEMO");
     return PM.on;
+}
+
+// NX2NAVI_PIPE_STAMP (default 0; ab = on in the B blocks): when the live pipe has not been written since the memo was
+// stored (vk_exec_pipe_touch) and the fields a draw sets itself match, skip the full VkPipeState compare. Mesh and
+// fallback draws still compare: foliage cull and the cleared vertex input are not in the stamp. A missed write site
+// would keep the previous pipeline, so this stays off until a picture check.
+static int pipe_stamp_on(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("PIPE_STAMP", "0");
+        if (mode == 1) rt_log("vk_exec: the pipeline memo skips the state compare when the stamp matches (NX2NAVI_PIPE_STAMP)");
+        else if (mode == 2) rt_log("vk_exec: the pipeline memo skips the state compare when the stamp matches, in the B blocks (NX2NAVI_PIPE_STAMP=ab)");
+    }
+    return RT_KNOB_ON(mode);
 }
 
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
@@ -4062,10 +4080,19 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     const char *why = NULL;
     uint64_t w0 = 0, m0 = 0;   // m0: when the lookup missed (wait_note)
     int kind = WK_LINK;
-    if (pipe_memo_on() && PM.valid && !memcmp(&PM.s, &s, sizeof s)) {
-        if (rt_trace & RT_TRACE_PERF) vk_exec_frame.pipe_hit++;
+    int use_stamp = pipe_stamp_on();
+    int stamp_hit = use_stamp && pipe_memo_on() && !mesh && !fb && PM.valid && PM.stamp && PM.stamp == ex->pipe_stamp && PM.s.vs == s.vs &&
+                    PM.s.fs == s.fs && PM.s.ts == s.ts && PM.s.prim == s.prim && PM.s.prim_restart == s.prim_restart &&
+                    PM.s.feedback == s.feedback && PM.s.depth_minus_w == s.depth_minus_w && PM.s.y_flip == s.y_flip;
+    uint64_t pipe_t0 = (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0;
+    if (stamp_hit || (pipe_memo_on() && PM.valid && !memcmp(&PM.s, &s, sizeof s))) {
+        if (rt_trace & RT_TRACE_PERF) {
+            vk_exec_frame.pipe_hit++;
+            if (stamp_hit) vk_exec_frame.pipe_stamp_hit++;
+        }
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
+        if (use_stamp) PM.stamp = ex->pipe_stamp;
     } else {
         if (rt_trace & RT_TRACE_PERF) vk_exec_frame.pipe_miss++;
         // Nearly every draw finds its pipeline, so the first lookup waits for nothing and the clock is read only for a
@@ -4116,7 +4143,9 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         if (m0) wait_note(kind, m0, pending), draw_stats_tick();
         PM.valid = !pending && p && info;
         if (PM.valid) PM.s = s, PM.info = info;
+        if (use_stamp) PM.stamp = PM.valid ? ex->pipe_stamp : 0;
     }
+    if (pipe_t0) vk_exec_frame.pipe_ns += kern_now_ns() - pipe_t0;
     uint64_t waited = w0 ? kern_now_ns() - w0 : 0;
     static int wait_logs;
     // also a one-shot draw skipped at the end of its wait, however short: its target may not be drawn again
@@ -4156,9 +4185,9 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     record_fixed(ex);
     repeat_stats(ex, info);
     {   // the replay's binding path is the CPU cost the frame profile needs to separate from recording
-        uint64_t bt = bt_now();
+        uint64_t bt = bind_span_now();
         bind_resources(ex, info);
-        vk_exec_frame.bind_ns += (uint64_t)(bt_now() - bt);
+        vk_exec_frame.bind_ns += (uint64_t)(bind_span_now() - bt);
         vk_exec_frame.bind_calls++;
     }
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
@@ -4703,10 +4732,35 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     // solid geometry only, which tests and writes the scene depth: effects, particles and screen quads write none, and
     // drawn again they would put their motion on the surfaces behind them (DLSS takes those from the surface)
     if (!B.st.ds.dt || !B.st.ds.dw) return;
-    // a vertex shader that reads a user bank besides the camera's (c4) may move on its own
+    // a vertex shader that reads a user bank besides the camera's (c4) may move on its own.
+    // NX2NAVI_MVOBJ_FAST (default 0; ab = on in the B blocks) remembers that answer per shader pointer and cache key,
+    // so a shader that reads no object bank does not walk its resources again. A pointer reused for a different shader
+    // misses the key and walks. Off, every indexed draw walks, as before.
+    static int mvfast = -1;
+    if (mvfast < 0) {
+        mvfast = rt_knob("MVOBJ_FAST", "0");
+        if (mvfast == 1) rt_log("vk_exec: a vertex shader that reads no object bank skips the motion resource walk (NX2NAVI_MVOBJ_FAST)");
+        else if (mvfast == 2) rt_log("vk_exec: a vertex shader that reads no object bank skips the motion resource walk, in the B blocks (NX2NAVI_MVOBJ_FAST=ab)");
+    }
     const GfxShaderRes *ur;
-    int nu = gfx_shader_resources(B.st.vs, GFX_RES_UBO, &ur), reads = 0;
-    for (int i = 0; i < nu; i++) reads |= ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4;
+    int reads = 0;
+    if (RT_KNOB_ON(mvfast)) {
+        static struct { const GfxShader *s; uint64_t k0; uint8_t reads; } mc[1024];
+        uint32_t mi = (uint32_t)((uintptr_t)B.st.vs * 0x9E3779B97F4A7C15ull >> 54);
+        uint64_t k0 = 0;
+        const uint8_t *key = gfx_shader_key(B.st.vs);
+        if (key) memcpy(&k0, key, sizeof k0);
+        if (mc[mi].s == B.st.vs && mc[mi].k0 == k0) reads = mc[mi].reads;
+        else {
+            int nu = gfx_shader_resources(B.st.vs, GFX_RES_UBO, &ur);
+            for (int i = 0; i < nu; i++) reads |= ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4;
+            mc[mi].s = B.st.vs, mc[mi].k0 = k0, mc[mi].reads = (uint8_t)(reads != 0);
+            reads = reads != 0;
+        }
+    } else {
+        int nu = gfx_shader_resources(B.st.vs, GFX_RES_UBO, &ur);
+        for (int i = 0; i < nu; i++) reads |= ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4;
+    }
     if (!reads) return;
     MO.cand++;
     uint64_t tp = t0 ? kern_now_ns() : 0;
@@ -5501,6 +5555,33 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     VK_MEM_BOUND(ip);
 }
 
+// NX2NAVI_IX_REUSE (default 0; ab = on in the B blocks): quad, line-loop and byte-index lists are built in one buffer
+// that grows, instead of a malloc and free on the draw. bind_index copies the bytes into this command buffer before
+// returning, so the next draw may reuse the buffer. Off, each list is malloc'd and freed.
+static void *ix_take(size_t bytes, int *owned) {
+    static int mode = -1;
+    static void *buf;
+    static size_t cap;
+    if (mode < 0) {
+        mode = rt_knob("IX_REUSE", "0");
+        if (mode == 1) rt_log("vk_exec: quad and byte index lists reuse one buffer (NX2NAVI_IX_REUSE)");
+        else if (mode == 2) rt_log("vk_exec: quad and byte index lists reuse one buffer in the B blocks (NX2NAVI_IX_REUSE=ab)");
+    }
+    if (rt_trace & RT_TRACE_PERF) vk_exec_frame.ix_n++;
+    if (!RT_KNOB_ON(mode)) {
+        *owned = 1;
+        return malloc(bytes);
+    }
+    *owned = 0;
+    if (cap < bytes) {
+        void *n = realloc(buf, bytes);
+        if (!n) rt_fatal("vk: out of memory");
+        buf = n;
+        cap = bytes;
+    }
+    return buf;
+}
+
 static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
     VkBuffer b;
     VkDeviceSize o;
@@ -5516,22 +5597,24 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
-        uint32_t *ix = malloc(sizeof *ix * 6 * q);
+        int own = 0;
+        uint32_t *ix = ix_take(sizeof *ix * 6 * q, &own);
         if (!ix) rt_fatal("vk: out of memory");
         for (uint32_t i = 0; i < q; i++) {
             uint32_t v = first + 4 * i, k[6] = {0, 1, 2, 0, 2, 3};
             for (int j = 0; j < 6; j++) ix[6 * i + j] = v + k[j];
         }
         bind_index(ex, ix, sizeof *ix * 6 * q, VK_INDEX_TYPE_UINT32);
-        free(ix);
+        if (own) free(ix);
         vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, 0, (uint32_t)d->base_instance);
     } else if (d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && n >= 2) {   // a strip that returns to its first vertex
-        uint32_t *ix = malloc(sizeof *ix * (n + 1));
+        int own = 0;
+        uint32_t *ix = ix_take(sizeof *ix * (n + 1), &own);
         if (!ix) rt_fatal("vk: out of memory");
         for (uint32_t i = 0; i < n; i++) ix[i] = first + i;
         ix[n] = first;
         bind_index(ex, ix, sizeof *ix * (n + 1), VK_INDEX_TYPE_UINT32);
-        free(ix);
+        if (own) free(ix);
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
@@ -5572,14 +5655,15 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
-        uint16_t *ix = malloc(sizeof *ix * (size_t)d->count);
+        int own = 0;
+        uint16_t *ix = ix_take(sizeof *ix * (size_t)d->count, &own);
         if (!ix) rt_fatal("vk: out of memory");
         for (int i = 0; i < d->count; i++) {
             uint8_t v = ((const uint8_t *)(uintptr_t)d->ibuf)[i];
             ix[i] = restart && v == 0xff ? 0xffff : v;
         }
         bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
-        free(ix);
+        if (own) free(ix);
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
@@ -5951,9 +6035,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     twin_dispatch = 1;
     {   // the replay's binding path is the CPU cost the frame profile needs to separate from recording
-        uint64_t bt = bt_now();
+        uint64_t bt = bind_span_now();
         bind_resources(ex, info);
-        vk_exec_frame.bind_ns += (uint64_t)(bt_now() - bt);
+        vk_exec_frame.bind_ns += (uint64_t)(bind_span_now() - bt);
         vk_exec_frame.bind_calls++;
     }
     twin_dispatch = 0;
@@ -5988,9 +6072,9 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     B.c0_valid[2] = 0;   // a fresh c0 range: the copy below must not change one an earlier dispatch reads
     twin_dispatch = 1;
     {   // the replay's binding path is the CPU cost the frame profile needs to separate from recording
-        uint64_t bt = bt_now();
+        uint64_t bt = bind_span_now();
         bind_resources(ex, info);
-        vk_exec_frame.bind_ns += (uint64_t)(bt_now() - bt);
+        vk_exec_frame.bind_ns += (uint64_t)(bind_span_now() - bt);
         vk_exec_frame.bind_calls++;
     }
     twin_dispatch = 0;
@@ -6061,13 +6145,13 @@ static void op_draw_impl(VkExec *ex, uint32_t op, const void *payload) {
         switch (b->kind) {
         case 0:
             memcpy(&bs, b->bytes, sizeof bs);
-            if (bs.target < 8) ex->pipe.blend[bs.target] = bs;
+            if (bs.target < 8) ex->pipe.blend[bs.target] = bs, vk_exec_pipe_touch(ex);
             break;
-        case 1: memcpy(&ex->pipe.color, b->bytes, sizeof ex->pipe.color); break;
-        case 2: memcpy(&ex->pipe.chmask, b->bytes, sizeof ex->pipe.chmask); break;
-        case 3: memcpy(&ex->pipe.ms, b->bytes, sizeof ex->pipe.ms); break;
-        case 4: memcpy(&ex->pipe.poly, b->bytes, sizeof ex->pipe.poly); break;
-        case 5: memcpy(&ex->pipe.ds, b->bytes, sizeof ex->pipe.ds); break;
+        case 1: memcpy(&ex->pipe.color, b->bytes, sizeof ex->pipe.color); vk_exec_pipe_touch(ex); break;
+        case 2: memcpy(&ex->pipe.chmask, b->bytes, sizeof ex->pipe.chmask); vk_exec_pipe_touch(ex); break;
+        case 3: memcpy(&ex->pipe.ms, b->bytes, sizeof ex->pipe.ms); vk_exec_pipe_touch(ex); break;
+        case 4: memcpy(&ex->pipe.poly, b->bytes, sizeof ex->pipe.poly); vk_exec_pipe_touch(ex); break;
+        case 5: memcpy(&ex->pipe.ds, b->bytes, sizeof ex->pipe.ds); vk_exec_pipe_touch(ex); break;
         case 6: memcpy(&ex->point_size, b->bytes, sizeof ex->point_size); break;
         }
         break;
@@ -6077,6 +6161,7 @@ static void op_draw_impl(VkExec *ex, uint32_t op, const void *payload) {
         if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break;
         memset(ex->pipe.vattr, 0, sizeof ex->pipe.vattr);   // the new list replaces the old one
         memcpy(&ex->pipe.vattr[b->first], b->st, sizeof(uint32_t) * (size_t)b->n);
+        vk_exec_pipe_touch(ex);
         break;
     }
     case OP_BIND_VSTREAM: {
@@ -6084,6 +6169,7 @@ static void op_draw_impl(VkExec *ex, uint32_t op, const void *payload) {
         if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break;
         memset(ex->pipe.vstream, 0, sizeof ex->pipe.vstream);
         memcpy(&ex->pipe.vstream[b->first], b->st, sizeof(vs_st) * (size_t)b->n);
+        vk_exec_pipe_touch(ex);
         break;
     }
     case OP_BIND_VBUF: {
