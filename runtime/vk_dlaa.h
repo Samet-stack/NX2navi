@@ -25,6 +25,7 @@ int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this r
 // and whether its history reset; 1 once per evaluation (0: none since the last call). The images stay valid until the
 // next frame's scene draws over them, after this present.
 int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, int *reset);
+int vk_dlaa_image_held(VkImage image);   // 1 when DLSS or Streamline was last given this image (depth, motion, output, HUD-less)
 // ... their views, and this frame's camera for DLSS Frame Generation (vk_dlssg.c): matrices for row vectors (v * M, the
 // rows stored in order), as Streamline takes them; 0 without a camera that frame.
 typedef struct {

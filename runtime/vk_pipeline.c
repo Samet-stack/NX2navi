@@ -49,6 +49,7 @@
 #include "platform/platform.h"
 #include "prp_file.h"
 #include "tex.h"
+#include "vk.h"
 #include "vk_build_gate.h"
 #include "vk_cache_file.h"
 #include "vk_save_retry.h"
@@ -3865,6 +3866,61 @@ int vk_pipeline_probe_buildgate(void) {
     return fails ? 1 : 0;
 }
 
+// A fast-linked pipeline kept after the optimised one replaced it (job_build). Draws read info.pipeline. The fast
+// handle stays until the submission that was open when it was replaced has finished: that command buffer may still
+// bind it. Stage libraries are not retired here. A link still holds their handles, and building one again hitches.
+static struct { VkPipeline pipe; uint64_t due; } *fastq;
+static int nfastq, cfastq;
+static PlatMutex fast_mu = PLAT_MUTEX_INIT;
+static uint64_t n_fast_retired;
+
+static int fast_enqueue(VkPipeline pipe) {
+    if (!pipe) return 0;
+    plat_mutex_lock(&fast_mu);
+    if (nfastq == cfastq) {
+        int c = cfastq ? cfastq * 2 : 32;
+        void *q = realloc(fastq, sizeof *fastq * (size_t)c);
+        if (!q) { plat_mutex_unlock(&fast_mu); return 0; }
+        fastq = q, cfastq = c;
+    }
+    fastq[nfastq].pipe = pipe;
+    fastq[nfastq].due = vk_sync_issued() + 1;   // the submission being recorded, which may already bind pipe
+    nfastq++;
+    plat_mutex_unlock(&fast_mu);
+    return 1;
+}
+
+static int fast_retire_take(int all, VkPipeline *local, int cap) {
+    uint64_t done = vk_sync_fence_done();
+    int n = 0, w = 0;
+    plat_mutex_lock(&fast_mu);
+    for (int i = 0; i < nfastq; i++) {
+        if ((all || fastq[i].due <= done) && n < cap) local[n++] = fastq[i].pipe;
+        else fastq[w++] = fastq[i];
+    }
+    nfastq = w;
+    plat_mutex_unlock(&fast_mu);
+    return n;
+}
+
+static void fast_destroy(VkPipeline *local, int n) {
+    for (int i = 0; i < n; i++) vkDestroyPipeline(P.device, local[i], NULL);
+    if (!n) return;
+    n_fast_retired += (uint64_t)n;
+    static int logs;
+    if (logs < 8) {
+        logs++;
+        rt_log("vk_pipeline: retired %d fast-linked pipelines the optimised build replaced (%llu so far)", n,
+               (unsigned long long)n_fast_retired);
+    }
+}
+
+void vk_pipeline_fast_sweep(void) {
+    if (!P.device) return;
+    VkPipeline local[32];
+    fast_destroy(local, fast_retire_take(0, local, 32));
+}
+
 // The whole build of job j, which the caller took off its queue, and the job's end: its pipeline is entered, the
 // threads waiting for it are woken and j is freed. lowrun: 1 on a pool worker that took j from the low queue. Caller
 // holds P.lock, which is released for the build.
@@ -3874,7 +3930,10 @@ static void job_build(Job *j, int lowrun) {
     plat_mutex_lock(&P.lock);
     if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
     ready_note(j->p, 0);
-    if (pipe && j->p->fast) P.g.swaps++;
+    if (pipe && j->p->fast) {
+        P.g.swaps++;
+        if (j->p->fast == pipe || fast_enqueue(j->p->fast)) j->p->fast = VK_NULL_HANDLE;
+    }
     j->p->building = 0;
     j->p->job = NULL;
     if (pipe) {
@@ -4439,7 +4498,10 @@ static void warm_builder(void *arg) {
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         ready_note(j->p, 0);
-        if (pipe && j->p->fast) P.g.swaps++;
+        if (pipe && j->p->fast) {
+            P.g.swaps++;
+            if (j->p->fast == pipe || fast_enqueue(j->p->fast)) j->p->fast = VK_NULL_HANDLE;
+        }
         j->p->building = 0;
         j->p->job = NULL;
         if (pipe) {
@@ -6915,6 +6977,12 @@ void vk_pipeline_shutdown(void) {
     vk_pipeline_save();
     plat_mutex_lock(&P.lock);
     vkDeviceWaitIdle(P.device);
+    VkPipeline retired[64];
+    for (;;) {
+        int nr = fast_retire_take(1, retired, 64);
+        fast_destroy(retired, nr);
+        if (nr < 64) break;
+    }
     for (int i = 0; i < PIPE_BUCKETS; i++) {
         for (Pipe *p = pipes[i], *n; p; p = n) {
             n = p->next;
