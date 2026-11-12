@@ -2334,8 +2334,8 @@ def build_opts(a, out):
         return None
     if a.march and not a.fast:
         fail('--march is part of --fast. The default build keeps its own -march.')
-    if a.toolchain and a.pgo != 'gen':
-        fail('--toolchain is only for --pgo gen. A --fast build uses the MSYS2 clang.')
+    if a.toolchain and not (a.fast or a.pgo):
+        fail('--toolchain goes with --pgo gen, --fast or --pgo FILE. The default build uses the MSYS2 clang.')
     if a.pgo == 'gen' and WIN and not a.toolchain:
         fail('--pgo gen: MSYS2 UCRT64 clang ships no profile runtime (clang_rt.profile). '
              'Download llvm-mingw 20261020 and pass --toolchain DIR. BUILD_FAST.md has the commands. '
@@ -2423,7 +2423,9 @@ def build_main():
                          '--toolchain, an llvm-mingw that has the profile runtime). FILE compiles with that '
                          '.profdata. Without --fast the lifted code is compiled at -O2; --fast keeps -O3')
     ap.add_argument('--toolchain', type=Path,
-                    help='with --pgo gen: llvm-mingw directory (bin/clang.exe). Headers and libraries stay MSYS2\'s')
+                    help='with --pgo gen, --fast or --pgo FILE: llvm-mingw directory (bin/clang.exe). Headers and '
+                         'libraries stay MSYS2\'s. Its ld.lld gives --fast thin LTO; a profile it wrote is read by '
+                         'the same compiler')
     ap.add_argument('--events', action='store_true', help='machine-readable progress lines on stdout ("@@" + JSON)')
     ap.add_argument('--make-runtime-lib', metavar='DIR', help='build the prebuilt runtime library of a release into DIR')
     ap.add_argument('--obj', help='with --make-runtime-lib: the folder for its objects')

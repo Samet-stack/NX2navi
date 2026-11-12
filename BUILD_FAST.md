@@ -64,7 +64,8 @@ Il ne s’applique que si tu passes `--fast`. Flags ajoutés ou remplacés, des 
   profil), **seulement si `ld.lld` est à côté du clang qui lie** (`tools/fast_build.py` `lto_ok`). GNU ld ne lie pas
   les objets LTO mince du clang UCRT64. Le toolchain du launcher n’a pas `ld.lld` : là, `--fast` reste à `-O3` sans
   LTO, et le log le dit (`no thin LTO: no ld.lld next to clang`). llvm-mingw a `ld.lld` : `build_game.py --toolchain`
-  et `make_game.py --pgo gen --toolchain` ajoutent le LTO mince. Avec `make_game.py`, sans `--toolchain`, il faut
+  et `make_game.py --fast --toolchain` (avec ou sans `--pgo`) ajoutent le LTO mince. Avec `make_game.py`, sans
+  `--toolchain`, il faut
   `ld.lld.exe` dans le `bin` MSYS2 (paquet `mingw-w64-ucrt-x86_64-lld`) ; le lien passe alors `-fuse-ld=lld`. La clé
   de l’étape `compile` gagne `+lto` dans ce cas seulement : un build `fast+znver4` sans LTO garde sa clé.
 - `-fno-plt`
@@ -208,7 +209,15 @@ py -I tools\pgo.py merge D:\Games\NX2navi\build-cache --version v111 --toolchain
 `v111` est une étiquette dans le `.json`. Ce n’est pas une version que `build_game.py` sait construire : 1.1.1 passe
 par `make_game.py`.
 
-L’exe optimisé, profil + fast, de nouveau avec le clang UCRT64 :
+L’exe optimisé, profil + fast. Avec `--toolchain`, le même clang d’llvm-mingw qui a écrit le profil le relit, et son
+`ld.lld` ajoute le LTO mince (section 2). Sans `--toolchain`, c’est le clang UCRT64, sans LTO ; il doit savoir lire le
+format du `.profdata` d’llvm-mingw 20261020 (clang 23), ce qui n’est pas vérifié ici :
+
+```bat
+py -I tools\make_game.py --rebuild --fast --march znver4 --pgo D:\src\NX2navi-fast\build\pgo\pgo-v111.profdata --toolchain D:\src\llvm-mingw-20261020-ucrt-x86_64 --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
+```
+
+Sans llvm-mingw, avec le clang UCRT64 :
 
 ```bat
 py -I tools\make_game.py --rebuild --fast --march znver4 --pgo D:\src\NX2navi-fast\build\pgo\pgo-v111.profdata --out D:\Games\NX2navi --msys "%LOCALAPPDATA%\Programs\NX2navi\toolchain\msys64\ucrt64"
