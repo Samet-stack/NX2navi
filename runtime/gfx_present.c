@@ -1178,9 +1178,13 @@ static int ng_image(NgImg *im, uint32_t w, uint32_t h, VkFormat f) {
 
 // The presenter and the images for the current swapchain (g_pl held). 0: frames go out the plain way.
 static int ng_ready(void) {
+    // Windows returns below before the NGX presenter wants anything. DLSS-G on that path still needs the picture
+    // without the HUD, and this used to clear the flag by never reaching the store.
+    if (vk_dlssg_active()) __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);
     if (!vk_ngxfg_wanted()) return 0;   // the Windows build, or a run that started without DLSS upscaling
     int want = vk_ngxfg_on() && !g_sc_hdr && !vk_fg_active() && !vk_dlssg_active();
-    if (!vk_fg_wanted()) vk_dlaa_hudless_wanted = want || vk_dlssg_active();   // the picture without the HUD
+    if (!vk_fg_wanted())
+        __atomic_store_n(&vk_dlaa_hudless_wanted, want || vk_dlssg_active(), __ATOMIC_RELAXED);
     if (!want) {   // off (the menu switched it off live): what the presenter holds goes out first
         if (ng.on) ng_drain(), ng.on = 0, rt_log("ngxfg: frame generation off");
         return 0;

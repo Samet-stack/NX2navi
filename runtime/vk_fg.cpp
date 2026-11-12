@@ -208,7 +208,7 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     (void)hudless_view;
     if (vk_fg4_active()) return vk_fg4_frame(cb, sc, fmt, ext, hudless, pic);
     if (!F.sc || F.failed) return;
-    vk_dlaa_hudless_wanted = 1;   // the upscaling pass keeps a copy of the picture before the HUD (vk_dlaa.c hudless)
+    __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);   // the upscaling pass keeps a copy before the HUD
     const VkCtx *c = vk_ctx();
     VkFfxImage depth, mv;
     float jx = 0, jy = 0;

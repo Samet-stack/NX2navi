@@ -243,6 +243,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     const VkTexImage *img = vk_texture_get(t);
     int held = frame_hold(vk_exec_pending_draws_take(), vk_dlaa_resized_take(), frame);
     if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        if (held) vk_dlssg_held_back();   // Streamline stays on until the next shown frame if nobody tells it
         if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         if (value) {   // the queued value is still signalled, in order

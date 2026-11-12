@@ -30,6 +30,9 @@ void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_
 // marker; frame is gfx_counters.frames of its present, the same count
 void vk_dlssg_submitted(uint64_t frame);
 void vk_dlssg_present_frame(uint64_t frame);   // the present thread's next blit and present are of this frame
+// A game present was not shown (vk_backend.c frame_hold: skipped draws, a resize, an area load). The present thread
+// never ran, so Streamline was not told. The next host present turns generation off and discards its history. Any thread.
+void vk_dlssg_held_back(void);
 uint64_t vk_dlssg_shown(void);   // the frames the display got, generated ones included (present thread); 0 when off
 void vk_dlssg_release(void);
 

@@ -290,7 +290,7 @@ extern "C" PFN_vkSetHdrMetadataEXT vk_fg4_hdr_metadata_fn(void) { return vk_fg4_
 
 extern "C" void vk_fg4_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D ext, VkImage hudless, const int pic[4]) {
     if (!vk_fg4_active() || F.failed) return;
-    vk_dlaa_hudless_wanted = 1;   // the upscaling pass keeps a copy of the picture before the HUD (vk_dlaa.c hudless)
+    __atomic_store_n(&vk_dlaa_hudless_wanted, 1, __ATOMIC_RELAXED);   // the upscaling pass keeps a copy before the HUD
     const VkCtx *c = vk_ctx();
     VkFfxImage depth, mv;
     float jx = 0, jy = 0;
